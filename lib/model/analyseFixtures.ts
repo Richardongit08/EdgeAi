@@ -378,11 +378,15 @@ export async function analyseFixtures(
           fixture.away_team,
           probabilities,
         );
-        if (modelProb === undefined || !bet.odds || bet.odds <= 1) return [];
-        return [makePick(fixture, bet.market, bet.selection, modelProb, statsInfo, {
-          price: bet.odds,
-          fairProb: 1 / bet.odds,
-        })];
+        if (modelProb === undefined) return [];
+        return [makePick(
+          fixture,
+          bet.market,
+          bet.selection,
+          modelProb,
+          statsInfo,
+          bet.odds && bet.odds > 1 ? { price: bet.odds, fairProb: 1 / bet.odds } : undefined,
+        )];
       }),
     ];
 
