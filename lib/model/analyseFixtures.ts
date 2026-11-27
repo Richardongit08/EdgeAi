@@ -1,6 +1,8 @@
-import { explainPicks } from "@/lib/ai/explain";
 import { deriveMarketProbabilities, type MarketProbabilities } from "@/lib/model/markets";
+import { poissonProbability } from "@/lib/model/poisson";
 import { removeMargin } from "@/lib/model/value";
+import { selectSingleBestPick } from "@/lib/model/selectBestPick";
+import type { TargetMarket } from "@/lib/ai/intent";
 import {
   getTeamStatistics,
   searchTeams,
@@ -23,6 +25,8 @@ export type FixtureWithOdds = OddsFixture & { confirmedBets?: ExtractedBet[] };
 
 export interface AnalyseFixturesOptions {
   limit?: number;
+  singleBestPerMatch?: boolean;
+  targetMarket?: TargetMarket;
 }
 
 interface ApiFootballTeamStatsResponse {
@@ -64,12 +68,21 @@ function leagueIdForSport(sportKey: string): number {
   const leagueIds: Record<string, number> = {
     soccer_epl: 39,
     soccer_germany_bundesliga: 78,
+    soccer_germany_bundesliga_2: 79,
     soccer_italy_serie_a: 135,
+    soccer_italy_serie_b: 136,
     soccer_spain_la_liga: 140,
+    soccer_spain_segunda_division: 141,
     soccer_france_ligue_one: 61,
     soccer_efl_champ: 40,
+    soccer_netherlands_eredivisie: 88,
+    soccer_portugal_primeira_liga: 94,
+    soccer_sco_premiership: 179,
+    soccer_belgium_first_div: 144,
+    soccer_turkey_super_league: 203,
     soccer_uefa_champs_league: 2,
     soccer_uefa_europa_league: 3,
+    soccer_uefa_europa_conference_league: 848,
   };
   return leagueIds[sportKey] ?? 39;
 }
@@ -168,6 +181,18 @@ function modelProbability(
     return undefined;
   }
 
+  if (normalizedMarket === "double_chance" || normalizedMarket.includes("double chance")) {
+    if (/1x|home.*draw|draw.*home/.test(normalizedSelection)) return probabilities.doubleChance.homeOrDraw;
+    if (/12|home.*away|away.*home/.test(normalizedSelection)) return probabilities.doubleChance.homeOrAway;
+    if (/x2|draw.*away|away.*draw/.test(normalizedSelection)) return probabilities.doubleChance.drawOrAway;
+  }
+
+  if (normalizedMarket === "draw_no_bet" || normalizedMarket.includes("draw no bet")) {
+    const totalWinProbability = probabilities.home + probabilities.away;
+    if (teamNameSimilarity(selection, homeName) >= 0.55) return probabilities.home / totalWinProbability;
+    if (teamNameSimilarity(selection, awayName) >= 0.55) return probabilities.away / totalWinProbability;
+  }
+
   if (normalizedMarket === "spreads" || normalizedMarket.includes("handicap") || normalizedMarket.includes("spread")) {
     const handicapPoint = point ?? Number(selection.match(/[+-]\s*\d+(?:\.\d+)?/)?.[0].replace(/\s/g, ""));
     if (!Number.isFinite(handicapPoint)) return undefined;
@@ -223,6 +248,8 @@ function makeOddsCandidates(
           const marketLabel = market.key === "h2h" ? "1X2"
             : market.key === "totals" ? `Goals Over/Under ${point}`.trim()
               : market.key === "spreads" ? "Asian Handicap"
+                : market.key === "double_chance" ? "Double Chance"
+                  : market.key === "draw_no_bet" ? "Draw No Bet"
                 : market.key === "btts" ? "BTTS" : market.key;
           candidates.push({
             market: marketLabel,
@@ -243,6 +270,8 @@ function makeOddsCandidates(
 function modelOnlyCandidates(
   fixture: OddsFixture,
   probabilities: MarketProbabilities,
+  homeStats: TeamStats,
+  awayStats: TeamStats,
 ): Array<{ market: string; selection: string; modelProb: number }> {
   const home = fixture.home_team;
   const away = fixture.away_team;
@@ -255,12 +284,39 @@ function modelOnlyCandidates(
     { market: "Double Chance", selection: "X2", modelProb: probabilities.doubleChance.drawOrAway },
     { market: "BTTS", selection: "Yes", modelProb: probabilities.bttsYes },
     { market: "BTTS", selection: "No", modelProb: probabilities.bttsNo },
+    ...probabilities.topCorrectScores.map(({ score, probability }) => ({
+      market: "Correct Score",
+      selection: score,
+      modelProb: probability,
+    })),
+    { market: "Draw No Bet", selection: home, modelProb: probabilities.home / Math.max(probabilities.home + probabilities.away, Number.EPSILON) },
+    { market: "Draw No Bet", selection: away, modelProb: probabilities.away / Math.max(probabilities.home + probabilities.away, Number.EPSILON) },
+    ...[-1.5, -0.5, 0.5, 1.5].flatMap((line) => [
+      { market: "Asian Handicap", selection: `${home} ${line > 0 ? "+" : ""}${line}`, modelProb: probabilities.homeHandicap[String(line)] ?? 0 },
+      { market: "Asian Handicap", selection: `${away} ${line > 0 ? "+" : ""}${line}`, modelProb: probabilities.awayHandicap[String(line)] ?? 0 },
+    ]),
   ];
   for (const line of [1.5, 2.5]) {
     candidates.push(
       { market: `Goals Over/Under ${line}`, selection: `Over ${line}`, modelProb: probabilities.over[line] },
       { market: `Goals Over/Under ${line}`, selection: `Under ${line}`, modelProb: probabilities.under[line] },
     );
+  }
+  if (
+    Number.isFinite(homeStats.shotsFor) && homeStats.shotsFor! > 0 &&
+    Number.isFinite(awayStats.shotsFor) && awayStats.shotsFor! > 0
+  ) {
+    const expectedShots = (homeStats.shotsFor! + awayStats.shotsFor!) / 2;
+    for (const line of [19.5, 22.5, 24.5]) {
+      let under = 0;
+      for (let shots = 0; shots <= Math.floor(line); shots += 1) {
+        under += poissonProbability(expectedShots, shots);
+      }
+      candidates.push(
+        { market: "Total Shots", selection: `Over ${line} Shots`, modelProb: 1 - under },
+        { market: "Total Shots", selection: `Under ${line} Shots`, modelProb: under },
+      );
+    }
   }
   return candidates;
 }
@@ -361,7 +417,7 @@ export async function analyseFixtures(
       dataQuality,
     };
     const candidatePicks = [
-      ...modelOnlyCandidates(fixture, probabilities).map((candidate) =>
+      ...modelOnlyCandidates(fixture, probabilities, homeStats, awayStats).map((candidate) =>
         makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo),
       ),
       ...makeOddsCandidates(fixture, probabilities).map((candidate) =>
@@ -395,15 +451,14 @@ export async function analyseFixtures(
     }
   }
 
-  const ranked = [...picksByKey.values()]
+  const allPicks = [...picksByKey.values()];
+  if (options.singleBestPerMatch) {
+    return selectSingleBestPick(allPicks, {
+      targetMarket: options.targetMarket ?? "all",
+      limit,
+    });
+  }
+  return allPicks
     .sort((a, b) => (b.ev ?? -Infinity) - (a.ev ?? -Infinity))
     .slice(0, limit);
-  const explanations = await explainPicks(
-    ranked,
-    "Expected goals, match probabilities, bookmaker prices, vig-adjusted fair probabilities, edge, expected value, and data quality are included in each computed pick.",
-  );
-  return ranked.map((pick, index) => ({
-    ...pick,
-    justification: explanations[index] || pick.justification,
-  }));
 }

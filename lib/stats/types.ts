@@ -27,6 +27,8 @@ export interface TeamStats {
   goalsAgainstAway: number;
   xgFor?: number;
   xgAgainst?: number;
+  shotsFor?: number;
+  shotsAgainst?: number;
   injuries: string[];
   standingsPosition?: number;
 }

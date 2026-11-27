@@ -4,12 +4,21 @@ import type { TeamStats } from "@/lib/stats/types";
 export const ESPN_LEAGUE_CODES: Record<string, string> = {
   soccer_epl: "eng.1",
   soccer_germany_bundesliga: "ger.1",
+  soccer_germany_bundesliga_2: "ger.2",
   soccer_italy_serie_a: "ita.1",
+  soccer_italy_serie_b: "ita.2",
   soccer_spain_la_liga: "esp.1",
+  soccer_spain_segunda_division: "esp.2",
   soccer_france_ligue_one: "fra.1",
   soccer_efl_champ: "eng.2",
+  soccer_netherlands_eredivisie: "ned.1",
+  soccer_portugal_primeira_liga: "por.1",
+  soccer_sco_premiership: "sco.1",
+  soccer_belgium_first_div: "bel.1",
+  soccer_turkey_super_league: "tur.1",
   soccer_uefa_champs_league: "uefa.champions",
   soccer_uefa_europa_league: "uefa.europa",
+  soccer_uefa_europa_conference_league: "uefa.europa.conf",
 };
 
 interface CacheEntry {
@@ -78,9 +87,50 @@ export async function getEspnLeagueData(espnCode: string): Promise<EspnLeagueDat
     if (!isRecord(event) || typeof event.id !== "string") return [];
     return [[event.id, event] as const];
   })).values()];
+  const completedEvents = uniqueEvents.filter((event) => {
+    if (!isRecord(event) || !isRecord(event.status) || !isRecord(event.status.type)) return false;
+    return event.status.type.completed === true || event.status.type.state === "post";
+  }).sort((a, b) => Date.parse(String(isRecord(b) ? b.date : "")) - Date.parse(String(isRecord(a) ? a.date : ""))).slice(0, 4);
+  const boxscoreResults = await Promise.allSettled(completedEvents.map(async (event) => {
+    if (!isRecord(event) || typeof event.id !== "string") return undefined;
+    const url = new URL(
+      `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(espnCode)}/summary`,
+    );
+    url.searchParams.set("event", event.id);
+    return [event.id, await fetchEspnJson(url.toString())] as const;
+  }));
+  const boxscoreByEvent = new Map(boxscoreResults.flatMap((result) =>
+    result.status === "fulfilled" && result.value ? [result.value] : [],
+  ));
+  const eventsWithBoxscores = uniqueEvents.map((event) => {
+    if (!isRecord(event) || typeof event.id !== "string") return event;
+    const summary = boxscoreByEvent.get(event.id);
+    const boxscore = isRecord(summary) && isRecord(summary.boxscore) ? summary.boxscore : undefined;
+    const teams = boxscore && Array.isArray(boxscore.teams) ? boxscore.teams.filter(isRecord) : [];
+    if (!Array.isArray(event.competitions)) return event;
+    const competitions = event.competitions.map((rawCompetition) => {
+      if (!isRecord(rawCompetition) || !Array.isArray(rawCompetition.competitors)) return rawCompetition;
+      const competitors = rawCompetition.competitors.map((rawCompetitor) => {
+        if (!isRecord(rawCompetitor) || !isRecord(rawCompetitor.team)) return rawCompetitor;
+        const teamId = String(rawCompetitor.team.id ?? "");
+        const teamName = String(rawCompetitor.team.displayName ?? rawCompetitor.team.name ?? "");
+        const boxscoreTeam = teams.find((rawTeam) => {
+          const boxTeam = isRecord(rawTeam.team) ? rawTeam.team : rawTeam;
+          return String(boxTeam.id ?? "") === teamId ||
+            (teamName && String(boxTeam.displayName ?? boxTeam.name ?? "") === teamName);
+        });
+        const statistics = boxscoreTeam && Array.isArray(boxscoreTeam.statistics)
+          ? boxscoreTeam.statistics
+          : undefined;
+        return statistics ? { ...rawCompetitor, statistics } : rawCompetitor;
+      });
+      return { ...rawCompetition, competitors };
+    });
+    return { ...event, competitions };
+  });
   return {
     standings: standingsResult.status === "fulfilled" ? standingsResult.value : null,
-    scoreboard: { events: uniqueEvents },
+    scoreboard: { events: eventsWithBoxscores },
   };
 }
 
@@ -166,6 +216,46 @@ function getScoreboardForm(scoreboard: unknown, teamName: string): number[] {
     .map((result) => result.form);
 }
 
+function getScoreboardShotAverages(
+  scoreboard: unknown,
+  teamName: string,
+): { shotsFor: number; shotsAgainst: number } | undefined {
+  if (!isRecord(scoreboard) || !Array.isArray(scoreboard.events)) return undefined;
+  const values: Array<{ shotsFor: number; shotsAgainst: number }> = [];
+  for (const rawEvent of scoreboard.events) {
+    if (!isRecord(rawEvent) || !Array.isArray(rawEvent.competitions)) continue;
+    const competition = rawEvent.competitions.find(isRecord);
+    if (!competition || !Array.isArray(competition.competitors)) continue;
+    const competitors = competition.competitors.filter(isRecord);
+    const matched = competitors.find((competitor) => {
+      if (!isRecord(competitor.team)) return false;
+      const name = competitor.team.displayName ?? competitor.team.name;
+      return typeof name === "string" && teamNameSimilarity(teamName, name) >= 0.62;
+    });
+    const opponent = competitors.find((competitor) => competitor !== matched);
+    if (!matched || !opponent) continue;
+    const getShots = (competitor: Record<string, unknown>) => {
+      const statistics = Array.isArray(competitor.statistics)
+        ? competitor.statistics.filter(isRecord)
+        : [];
+      const stat = statistics.find((item) => {
+        const name = String(item.name ?? item.displayName ?? "").toLowerCase().replace(/[^a-z]/g, "");
+        return name === "shots" || name === "totalshots";
+      });
+      const value = Number(stat?.value ?? stat?.displayValue);
+      return Number.isFinite(value) ? value : undefined;
+    };
+    const shotsFor = getShots(matched);
+    const shotsAgainst = getShots(opponent);
+    if (shotsFor !== undefined && shotsAgainst !== undefined) values.push({ shotsFor, shotsAgainst });
+  }
+  if (values.length === 0) return undefined;
+  return {
+    shotsFor: values.reduce((total, item) => total + item.shotsFor, 0) / values.length,
+    shotsAgainst: values.reduce((total, item) => total + item.shotsAgainst, 0) / values.length,
+  };
+}
+
 export function getEspnTeamStats(
   standings: unknown,
   teamName: string,
@@ -190,9 +280,12 @@ export function getEspnTeamStats(
   const losses = getStat(entry, "losses", "loss") ?? 0;
   const goalsFor = getStat(entry, "pointsfor", "goalsfor", "gf") ?? 0;
   const goalsAgainst = getStat(entry, "pointsagainst", "goalsagainst", "ga") ?? 0;
+  const shotsFor = getStat(entry, "shotsfor", "totalshots");
+  const shotsAgainst = getStat(entry, "shotsagainst", "opponentshots");
   if (gamesPlayed <= 0) return undefined;
   const position = getStat(entry, "rank", "position", "playoffseed");
   const form = getScoreboardForm(scoreboard, matched.name);
+  const boxscoreShots = getScoreboardShotAverages(scoreboard, matched.name);
   const standingsForm = toForm(getStatString(entry, "form", "streak"));
   const halfSeasonGames = Math.max(gamesPlayed / 2, 1);
   const goalsForPerSide = goalsFor / 2;
@@ -210,6 +303,8 @@ export function getEspnTeamStats(
     goalsAgainstHome: goalsAgainstPerSide,
     goalsForAway: goalsForPerSide,
     goalsAgainstAway: goalsAgainstPerSide,
+    shotsFor: boxscoreShots?.shotsFor ?? (shotsFor === undefined ? undefined : shotsFor / gamesPlayed),
+    shotsAgainst: boxscoreShots?.shotsAgainst ?? (shotsAgainst === undefined ? undefined : shotsAgainst / gamesPlayed),
     standingsPosition: position,
     injuries: [],
   };
