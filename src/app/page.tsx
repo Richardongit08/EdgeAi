@@ -43,9 +43,10 @@ export default function Home() {
         body: JSON.stringify({ message: question }),
       });
       const text = await response.text();
-      const data = JSON.parse(text) as { message?: string; error?: string };
+      const data = JSON.parse(text) as { reply?: string; picks?: Pick[]; error?: string };
       if (!response.ok) throw new Error(data.error ?? "Chat request failed.");
-      setMessages((current) => [...current, { role: "assistant", text: data.message ?? "" }]);
+      if (data.picks?.length) setPicks(data.picks);
+      setMessages((current) => [...current, { role: "assistant", text: data.reply ?? "" }]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Chat request failed.");
     } finally {

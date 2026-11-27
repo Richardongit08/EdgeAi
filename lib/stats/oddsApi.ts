@@ -88,11 +88,21 @@ export async function getUpcomingOddsFixtures(): Promise<OddsFixture[]> {
 export function findOddsFixture(fixtures: OddsFixture[], homeName: string, awayName: string): OddsFixture | undefined {
   return fixtures
     .map((fixture) => {
-      const homeSimilarity = teamNameSimilarity(homeName, fixture.home_team);
-      const awaySimilarity = teamNameSimilarity(awayName, fixture.away_team);
-      return { fixture, score: (homeSimilarity + awaySimilarity) / 2, homeSimilarity, awaySimilarity };
+      const directHome = teamNameSimilarity(homeName, fixture.home_team);
+      const directAway = teamNameSimilarity(awayName, fixture.away_team);
+      const reverseHome = teamNameSimilarity(homeName, fixture.away_team);
+      const reverseAway = teamNameSimilarity(awayName, fixture.home_team);
+      const directScore = (directHome + directAway) / 2;
+      const reverseScore = (reverseHome + reverseAway) / 2;
+      return {
+        fixture,
+        score: Math.max(directScore, reverseScore),
+        teamScores: directScore >= reverseScore
+          ? [directHome, directAway]
+          : [reverseHome, reverseAway],
+      };
     })
-    .filter((match) => match.homeSimilarity >= 0.62 && match.awaySimilarity >= 0.62)
+    .filter((match) => match.teamScores.every((score) => score >= 0.72))
     .sort((a, b) => b.score - a.score)[0]?.fixture;
 }
 

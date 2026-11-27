@@ -21,7 +21,10 @@ export function PickCard({ pick }: { pick: Pick }) {
           <h3 className="mt-1 text-base font-semibold text-white">{pick.match}</h3>
           <p className="mt-1 text-sm text-slate-300">{pick.selection}</p>
         </div>
-        <span className={`rounded-full border px-2 py-1 text-xs capitalize ${tone}`}>{pick.confidence}</span>
+        <div className="flex flex-col items-end gap-1">
+          <span className={`rounded-full border px-2 py-1 text-xs capitalize ${tone}`}>{pick.confidence}</span>
+          {pick.lowValue && <span className="rounded-full border border-rose-400/30 bg-rose-400/10 px-2 py-1 text-[10px] text-rose-300">Low value</span>}
+        </div>
       </div>
       <div className="mb-2 flex items-end justify-between">
         <span className="text-2xl font-bold text-white">{probability}%</span>
