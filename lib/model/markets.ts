@@ -15,7 +15,7 @@ export interface MarketProbabilities {
 function strength(stats: TeamStats, side: "home" | "away", leagueAvgGoals: number) {
   const goalsFor = side === "home" ? stats.goalsForHome : stats.goalsForAway;
   const goalsAgainst = side === "home" ? stats.goalsAgainstHome : stats.goalsAgainstAway;
-  const sample = Math.max(stats.form.length, 1);
+  const sample = Math.max(stats.sampleSize ?? stats.form.length, 1);
   const attack = goalsFor / Math.max(sample * leagueAvgGoals / 2, 1);
   const defence = 2 - goalsAgainst / Math.max(sample * leagueAvgGoals / 2, 1);
   return { attack: Math.max(0.55, Math.min(1.45, attack)), defence: Math.max(0.55, Math.min(1.45, defence)) };

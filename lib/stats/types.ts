@@ -14,6 +14,13 @@ export type ExtractedBet = z.infer<typeof extractedBetSchema>;
 
 export interface TeamStats {
   form: number[];
+  sampleSize?: number;
+  gamesPlayed?: number;
+  wins?: number;
+  draws?: number;
+  losses?: number;
+  goalsFor?: number;
+  goalsAgainst?: number;
   goalsForHome: number;
   goalsAgainstHome: number;
   goalsForAway: number;
@@ -46,5 +53,5 @@ export interface Pick {
   ev: number | null;
   confidence: Confidence;
   justification: string;
-  dataQuality: "complete" | "partial" | "insufficient" | "model_only";
+  dataQuality: "complete" | "partial" | "insufficient" | "model_only" | "limited";
 }

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { classifyIntent } from "@/lib/ai/intent";
-import { getFixtures } from "@/lib/stats/apiFootball";
+import { findOddsFixture, getUpcomingOddsFixtures } from "@/lib/stats/oddsApi";
 
 export const maxDuration = 60;
 export const dynamic = "force-dynamic";
@@ -13,25 +13,39 @@ export async function POST(request: NextRequest) {
     }
     const message = body.message.trim();
     const intent = await classifyIntent(message);
-    let bestPlaysNote = "";
-    if (intent === "best_plays") {
-      const today = new Date().toISOString().slice(0, 10);
-      const inSevenDays = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      const fixturesResult = await Promise.allSettled([
-        getFixtures({ date: today, from: today, to: inSevenDays }),
-      ]);
-      const first = fixturesResult[0];
-      if (first.status === "fulfilled") {
-        bestPlaysNote = ` Scan is limited to the top 6 upcoming fixtures. ${first.value.response.length} fixtures available.`;
-      }
-    }
+    const fixtures = intent === "best_plays" || intent === "analyse_match"
+      ? await getUpcomingOddsFixtures()
+      : [];
+    const upcoming = fixtures.slice(0, 6);
+    const fixtureLines = (items: typeof upcoming) => items.map((fixture) =>
+      `${fixture.home_team} vs ${fixture.away_team} (${new Date(fixture.commence_time).toLocaleString()})`,
+    );
+    const pair = message
+      .replace(/^(please\s+)?(analyse|analyze)(\s+the)?(\s+match)?\s+/i, "")
+      .match(/^(.+?)\s+(?:vs|versus|v)\s+(.+?)(?:\s+(?:tonight|today|tomorrow|this\s+week|on\s+.+))?$/i);
+    const specificFixture = pair
+      ? findOddsFixture(fixtures, pair[1].trim(), pair[2].trim())
+      : undefined;
     const responses: Record<typeof intent, string> = {
-      best_plays: `I can rank value plays only after live team statistics and the available bookmaker prices are loaded.${bestPlaysNote}`,
-      analyse_match: "Send a match in the format Team vs Team, or upload a screenshot containing the odds.",
+      best_plays: upcoming.length > 0
+        ? `Upcoming fixtures with live odds (showing the first ${upcoming.length}):\n${fixtureLines(upcoming).join("\n")}`
+        : "No upcoming fixtures with live odds are currently available. Check ODDS_API_KEY and try again.",
+      analyse_match: specificFixture
+        ? `Found the requested fixture from live odds: ${specificFixture.home_team} vs ${specificFixture.away_team} at ${new Date(specificFixture.commence_time).toLocaleString()}.`
+        : pair
+          ? `The requested fixture was not found in the upcoming live-odds list.${upcoming.length ? ` Upcoming fixtures:\n${fixtureLines(upcoming).join("\n")}` : ""}`
+          : `Name a fixture in the format Team vs Team.${upcoming.length ? ` Upcoming fixtures:\n${fixtureLines(upcoming).join("\n")}` : ""}`,
       explain_pick: "Select a pick card to see the computed data behind it.",
       general: "Ask for the best plays today, analyse a specific match, or upload a fixtures and odds screenshot.",
     };
-    return NextResponse.json({ intent, message: responses[intent] });
+    return NextResponse.json({
+      intent,
+      message: responses[intent],
+      fixtures: intent === "analyse_match"
+        ? specificFixture ? [specificFixture] : upcoming
+        : intent === "best_plays" ? upcoming : [],
+      fixture: specificFixture ?? null,
+    });
   } catch {
     return NextResponse.json({ error: "Could not process the chat question." }, { status: 400 });
   }
