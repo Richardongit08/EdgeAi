@@ -1,6 +1,7 @@
 import { classifyIntent, extractPickLimit, extractRequestedMatch } from "@/lib/ai/intent";
 import { extractBetsFromImage } from "@/lib/ai/extract";
 import { analyseFixtures, type FixtureWithOdds } from "@/lib/model/analyseFixtures";
+import { selectBestPick } from "@/lib/model/selectBestPick";
 import { extractedBetSchema, type ExtractedBet, type Pick } from "@/lib/stats/types";
 import {
   findOddsFixture,
@@ -88,55 +89,68 @@ export async function sendTelegramMessage(
   }
 }
 
+export async function sendTelegramMessages(
+  chatId: number | string,
+  messages: string[],
+): Promise<void> {
+  for (const message of messages) {
+    await sendTelegramMessage(chatId, message);
+  }
+}
+
 export function selectHighestProbabilityPick(picks: Pick[]): Pick | undefined {
-  return [...picks].sort((a, b) =>
-    b.modelProb - a.modelProb || (b.ev ?? -Infinity) - (a.ev ?? -Infinity),
-  )[0];
+  return selectBestPick(picks);
+}
+
+export function formatBestPickMessages(picks: Pick[]): string[] {
+  return picks.map((pick, index) => {
+    const message = [
+      `Match: ${pick.match}`,
+      `Probability: ${(pick.modelProb * 100).toFixed(1)}%`,
+      `Pick: ${pick.selection}`,
+      `odds: ${(pick.bookOdds !== null && Number.isFinite(pick.bookOdds) && pick.bookOdds > 1
+        ? pick.bookOdds
+        : 1 / Math.min(Math.max(pick.modelProb, 0.0001), 1)).toFixed(2)}`,
+    ].join("\n");
+    return index === picks.length - 1 ? `${message}\n\n${DISCLAIMER}` : message;
+  });
 }
 
 export function formatBestPicks(picks: Pick[]): string {
-  const matches = picks.map((pick) =>
-    [
-      `Match: ${pick.match}`,
-      `Highest-probability pick: ${pick.selection} (${(pick.modelProb * 100).toFixed(1)}% win/hit chance)`,
-      `Decimal odds: ${pick.bookOdds === null ? "Unavailable" : pick.bookOdds.toFixed(2)}`,
-      `Statistical justification: The Poisson model estimates a ${(pick.modelProb * 100).toFixed(1)}% chance using available team statistics (data quality: ${pick.dataQuality}).`,
-    ].join("\n"),
-  );
-  return `${matches.join("\n\n")}${matches.length ? "\n\n" : ""}${DISCLAIMER}`;
+  return formatBestPickMessages(picks).join("\n\n");
 }
 
-function isHelpCommand(text: string): boolean {
-  return /^\/(?:start|help)(?:@\w+)?(?:\s|$)/i.test(text.trim());
+function plainReply(message: string): string[] {
+  return [message];
 }
 
-async function textReply(text: string): Promise<string> {
-  if (isHelpCommand(text)) return WELCOME_MESSAGE;
+async function textReply(text: string): Promise<string[]> {
+  if (isHelpCommand(text)) return plainReply(WELCOME_MESSAGE);
 
   const intent = await classifyIntent(text);
   if (intent === "general" || intent === "explain_pick") {
-    return "Ask for the best plays or name a match (Team A vs Team B). You can also upload a bet-slip screenshot for analysis.";
+    return plainReply("Ask for the best plays or name a match (Team A vs Team B). You can also upload a bet-slip screenshot for analysis.");
   }
 
   const fixtures = await getUpcomingOddsFixtures();
   if (intent === "analyse_match") {
     const requestedMatch = extractRequestedMatch(text);
-    if (!requestedMatch) return "Name the match in the format Team A vs Team B.";
+    if (!requestedMatch) return plainReply("Name the match in the format Team A vs Team B.");
     const fixture = findOddsFixture(fixtures, requestedMatch.home, requestedMatch.away);
     if (!fixture) {
-      return `I couldn't match ${requestedMatch.home} vs ${requestedMatch.away} to an upcoming fixture with live odds.`;
+      return plainReply(`I couldn't match ${requestedMatch.home} vs ${requestedMatch.away} to an upcoming fixture with live odds.`);
     }
     const picks = await analyseFixtures([fixture], { limit: MAX_PICKS_PER_FIXTURE });
     const bestPick = selectHighestProbabilityPick(picks);
     return bestPick
-      ? formatBestPicks([bestPick])
-      : "No statistical picks are available for that match right now.";
+      ? formatBestPickMessages([bestPick])
+      : plainReply("No statistical picks are available for that match right now.");
   }
 
   const fixtureLimit = extractPickLimit(text) ?? 6;
   const upcomingFixtures = fixtures.slice(0, fixtureLimit);
   if (upcomingFixtures.length === 0) {
-    return "No upcoming fixtures with odds are available to analyse. Check ODDS_API_KEY and try again.";
+    return plainReply("No upcoming fixtures with odds are available to analyse. Check ODDS_API_KEY and try again.");
   }
 
   const picksByFixture = await Promise.all(upcomingFixtures.map((fixture) =>
@@ -146,8 +160,12 @@ async function textReply(text: string): Promise<string> {
     .map(selectHighestProbabilityPick)
     .filter((pick): pick is Pick => pick !== undefined);
   return bestPicks.length
-    ? formatBestPicks(bestPicks)
-    : "No statistical picks are available for the upcoming fixtures right now.";
+    ? formatBestPickMessages(bestPicks)
+    : plainReply("No statistical picks are available for the upcoming fixtures right now.");
+}
+
+function isHelpCommand(text: string): boolean {
+  return /^\/(?:start|help)(?:@\w+)?(?:\s|$)/i.test(text.trim());
 }
 
 function fixtureForBet(bet: ExtractedBet, fixtures: OddsFixture[], index: number): FixtureWithOdds {
@@ -222,10 +240,14 @@ async function photoReply(message: TelegramMessage): Promise<string> {
   return `${legs.join("\n\n")}\n\n${DISCLAIMER}`;
 }
 
-export async function createTelegramReply(message: TelegramMessage): Promise<string> {
-  if (message.photo?.length) return photoReply(message);
+export async function createTelegramReplyMessages(message: TelegramMessage): Promise<string[]> {
+  if (message.photo?.length) return [await photoReply(message)];
   if (typeof message.text === "string" && message.text.trim()) {
     return textReply(message.text.trim());
   }
-  return "Send a football match question or upload a bet-slip screenshot.";
+  return plainReply("Send a football match question or upload a bet-slip screenshot.");
+}
+
+export async function createTelegramReply(message: TelegramMessage): Promise<string> {
+  return (await createTelegramReplyMessages(message)).join("\n\n");
 }

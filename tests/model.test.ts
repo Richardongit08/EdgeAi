@@ -5,8 +5,8 @@ import { buildScoreMatrix } from "../lib/model/poisson";
 import { deriveMarketProbabilities, matrixSum } from "../lib/model/markets";
 import { calculateValue, removeMargin } from "../lib/model/value";
 import { fuzzyTeamMatch, levenshtein } from "../lib/stats/fuzzy";
-import { getEspnTeamStats } from "../lib/stats/espnStats";
-import { findOddsFixture, type OddsFixture } from "../lib/stats/oddsApi";
+import { getEspnTeamStats, leagueAverageTeamStats } from "../lib/stats/espnStats";
+import { findOddsFixture, getMarketOdds, type OddsFixture } from "../lib/stats/oddsApi";
 import type { MatchContext } from "../lib/stats/types";
 
 describe("probability engine", () => {
@@ -41,6 +41,32 @@ describe("probability engine", () => {
     const markets = deriveMarketProbabilities(context);
     expect(markets.home + markets.draw + markets.away).toBeCloseTo(1, 8);
     expect(markets.over[2.5] + markets.under[2.5]).toBeCloseTo(1, 8);
+  });
+
+  it("uses calibrated expected goals whenever team statistics need a baseline", () => {
+    const baseline = leagueAverageTeamStats();
+    const markets = deriveMarketProbabilities({
+      homeName: "Home",
+      awayName: "Away",
+      leagueAvgGoals: 2.65,
+      h2h: [],
+      home: baseline,
+      away: {
+        form: [],
+        goalsForHome: 10,
+        goalsAgainstHome: 8,
+        goalsForAway: 10,
+        goalsAgainstAway: 8,
+        injuries: [],
+      },
+    });
+
+    expect(markets.lambdaHome).toBe(1.38);
+    expect(markets.lambdaAway).toBe(1.14);
+    expect(markets.over[1.5]).toBeGreaterThanOrEqual(0.65);
+    expect(markets.over[1.5]).toBeLessThanOrEqual(0.82);
+    expect(markets.doubleChance.homeOrDraw).toBeGreaterThanOrEqual(0.65);
+    expect(markets.doubleChance.homeOrDraw).toBeLessThanOrEqual(0.82);
   });
 
   it("removes bookmaker margin", () => {
@@ -83,6 +109,50 @@ describe("probability engine", () => {
       bookmakers: [],
     }];
     expect(findOddsFixture(fixtures, "borrusia", "werder bremen")?.id).toBe("fixture-reversed");
+  });
+
+  it("extracts direct decimal prices and derives Double Chance prices from h2h", () => {
+    const fixture: OddsFixture = {
+      id: "prices-fixture",
+      sport_key: "soccer_epl",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Arsenal",
+      away_team: "Chelsea",
+      bookmakers: [{
+        key: "test-book",
+        title: "Test Book",
+        markets: [
+          {
+            key: "h2h",
+            outcomes: [
+              { name: "Arsenal", price: 2.1 },
+              { name: "Draw", price: 3.2 },
+              { name: "Chelsea", price: 3.6 },
+            ],
+          },
+          {
+            key: "totals",
+            outcomes: [
+              { name: "Over", point: 2.5, price: 2.05 },
+              { name: "Under", point: 2.5, price: 1.8 },
+            ],
+          },
+          {
+            key: "spreads",
+            outcomes: [
+              { name: "Arsenal", point: -0.5, price: 2.0 },
+              { name: "Chelsea", point: 0.5, price: 1.9 },
+            ],
+          },
+        ],
+      }],
+    };
+
+    expect(getMarketOdds(fixture, "Home", "h2h")).toBe(2.1);
+    expect(getMarketOdds(fixture, "Over 2.5", "Goals Over/Under 2.5")).toBe(2.05);
+    expect(getMarketOdds(fixture, "Over 3.5", "Totals")).toBeNull();
+    expect(getMarketOdds(fixture, "Arsenal -0.5", "Asian Handicap")).toBe(2.0);
+    expect(getMarketOdds(fixture, "1X", "Double Chance")).toBeCloseTo(1 / (1 / 2.1 + 1 / 3.2), 8);
   });
 
   it("recognizes best-play phrasing and requested match limits", async () => {
@@ -158,6 +228,7 @@ describe("probability engine", () => {
     const picks = await analyseFixtures([fixture], { limit: 20 });
     expect(picks.length).toBeGreaterThan(0);
     expect(picks.some((pick) => pick.bookOdds !== null)).toBe(true);
+    expect(picks.some((pick) => pick.market === "Double Chance" && pick.bookOdds !== null)).toBe(true);
     expect(picks.some((pick) => pick.lowValue)).toBe(true);
     expect(picks.map((pick) => pick.ev ?? -Infinity)).toEqual(
       [...picks].map((pick) => pick.ev ?? -Infinity).sort((a, b) => b - a),

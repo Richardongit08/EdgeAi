@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  createTelegramReply,
+  createTelegramReplyMessages,
   sendTelegramChatAction,
   sendTelegramMessage,
+  sendTelegramMessages,
   type TelegramMessage,
 } from "@/lib/channels/telegram";
 
@@ -81,7 +82,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    await sendTelegramMessage(message.chat.id, await createTelegramReply(message));
+    await sendTelegramMessages(message.chat.id, await createTelegramReplyMessages(message));
     return NextResponse.json({ ok: true });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Could not process Telegram update.";
