@@ -7,6 +7,14 @@ function normalize(value: string): string {
     .trim();
 }
 
+export function teamNameSimilarity(first: string, second: string): number {
+  const left = normalize(first);
+  const right = normalize(second);
+  if (!left || !right) return 0;
+  const distance = levenshtein(left, right);
+  return 1 - distance / Math.max(left.length, right.length);
+}
+
 export function levenshtein(a: string, b: string): number {
   const left = normalize(a);
   const right = normalize(b);

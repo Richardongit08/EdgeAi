@@ -3,6 +3,8 @@ import { buildScoreMatrix } from "../lib/model/poisson";
 import { deriveMarketProbabilities, matrixSum } from "../lib/model/markets";
 import { calculateValue, removeMargin } from "../lib/model/value";
 import { fuzzyTeamMatch, levenshtein } from "../lib/stats/fuzzy";
+import { getEspnTeamStats } from "../lib/stats/espnStats";
+import { findOddsFixture, type OddsFixture } from "../lib/stats/oddsApi";
 import type { MatchContext } from "../lib/stats/types";
 
 describe("probability engine", () => {
@@ -53,5 +55,72 @@ describe("probability engine", () => {
   it("matches similar team names", () => {
     expect(levenshtein("Tottenham", "Tottenham Hotspur")).toBeGreaterThan(0);
     expect(fuzzyTeamMatch("Chelsea FC", [{ name: "Chelsea" }, { name: "Arsenal" }])?.name).toBe("Chelsea");
+  });
+
+  it("uses fuzzy team matching for odds fixtures without selecting unrelated events", () => {
+    const fixtures: OddsFixture[] = [{
+      id: "fixture-1",
+      sport_key: "soccer_epl",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Nottingham Forest",
+      away_team: "Chelsea",
+      bookmakers: [],
+    }];
+    expect(findOddsFixture(fixtures, "Nott'm Forest", "Chelsea FC")?.id).toBe("fixture-1");
+    expect(findOddsFixture(fixtures, "Arsenal", "Liverpool")).toBeUndefined();
+  });
+
+  it("maps live ESPN standings and recent scoreboard form into team stats", () => {
+    const standings = {
+      children: [{
+        standings: {
+          entries: [{
+            team: { displayName: "Chelsea" },
+            stats: [
+              { name: "gamesPlayed", value: 12 },
+              { name: "wins", value: 7 },
+              { name: "ties", value: 3 },
+              { name: "losses", value: 2 },
+              { name: "pointsFor", value: 24 },
+              { name: "pointsAgainst", value: 14 },
+              { name: "rank", value: 4 },
+              { name: "form", displayValue: "W-D-W-L-W" },
+            ],
+          }],
+        },
+      }],
+    };
+    const scoreboard = {
+      events: [{
+        date: "2026-11-25T19:00Z",
+        status: { type: { completed: true, state: "post" } },
+        competitions: [{
+          competitors: [
+            { homeAway: "home", score: "2", team: { displayName: "Chelsea" } },
+            { homeAway: "away", score: "1", team: { displayName: "Arsenal" } },
+          ],
+        }],
+      }, {
+        date: "2026-11-27T20:00Z",
+        status: { type: { completed: false, state: "pre" } },
+        competitions: [{
+          competitors: [
+            { homeAway: "home", score: "0", team: { displayName: "Chelsea" } },
+            { homeAway: "away", score: "0", team: { displayName: "Arsenal" } },
+          ],
+        }],
+      }],
+    };
+    const stats = getEspnTeamStats(standings, "Chelsea FC", scoreboard);
+    expect(stats).toMatchObject({
+      gamesPlayed: 12,
+      wins: 7,
+      draws: 3,
+      losses: 2,
+      goalsFor: 24,
+      goalsAgainst: 14,
+      standingsPosition: 4,
+      form: [1],
+    });
   });
 });
