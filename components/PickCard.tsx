@@ -14,7 +14,7 @@ export function PickCard({ pick }: { pick: Pick }) {
       : "border-slate-400/30 bg-slate-400/10 text-slate-300";
 
   return (
-    <article className="rounded-2xl border border-white/[0.08] bg-[#151820] p-4 shadow-xl shadow-black/10">
+    <article className="rounded-2xl border border-white/[0.08] bg-[#121821] p-4 shadow-xl shadow-black/10">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <p className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500">{pick.market}</p>
@@ -31,14 +31,14 @@ export function PickCard({ pick }: { pick: Pick }) {
         <span className="text-sm text-slate-400">Model probability</span>
       </div>
       <div className="h-2 overflow-hidden rounded-full bg-white/5">
-        <div className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-cyan-400" style={{ width: `${probability}%` }} />
+        <div className="h-full rounded-full bg-gradient-to-r from-emerald-600 to-emerald-400" style={{ width: `${probability}%` }} />
       </div>
       <div className="mt-4 grid grid-cols-3 gap-2 text-sm">
         <div className="rounded-lg bg-black/20 p-2"><span className="block text-xs text-slate-500">Odds</span><strong className="text-slate-100">{pick.bookOdds === null ? "Model only" : pick.bookOdds.toFixed(2)}</strong></div>
         <div className="rounded-lg bg-black/20 p-2"><span className="block text-xs text-slate-500">Edge</span><strong className={edge !== null && edge >= 0 ? "text-emerald-300" : "text-red-300"}>{edge === null ? "N/A" : `${edge >= 0 ? "+" : ""}${edge}%`}</strong></div>
         <div className="rounded-lg bg-black/20 p-2"><span className="block text-xs text-slate-500">EV</span><strong className="text-slate-100">{pick.ev === null ? "N/A" : `${(pick.ev * 100).toFixed(1)}%`}</strong></div>
       </div>
-      <button type="button" onClick={() => setOpen((value) => !value)} className="mt-3 text-sm font-medium text-cyan-300">
+      <button type="button" onClick={() => setOpen((value) => !value)} className="mt-3 text-sm font-medium text-emerald-300">
         {open ? "Hide justification" : "View justification"}
       </button>
       {open && <p className="mt-2 border-t border-white/[0.07] pt-3 text-sm leading-6 text-slate-300">{pick.justification}</p>}

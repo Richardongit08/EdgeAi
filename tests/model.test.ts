@@ -1,13 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { classifyIntent, extractPickLimit, extractRequestedMatch } from "../lib/ai/intent";
-import { analyseFixtures } from "../lib/model/analyseFixtures";
+import {
+  classifyIntent,
+  classifyMessage,
+  extractPickLimit,
+  extractRequestedMatch,
+} from "../lib/ai/intent";
+import { analyseFixtures, rankPicks } from "../lib/model/analyseFixtures";
 import { buildScoreMatrix } from "../lib/model/poisson";
 import { deriveMarketProbabilities, matrixSum } from "../lib/model/markets";
+import { deriveShotMarketProbabilities } from "../lib/model/shots";
 import { calculateValue, removeMargin } from "../lib/model/value";
 import { fuzzyTeamMatch, levenshtein } from "../lib/stats/fuzzy";
-import { getEspnTeamStats } from "../lib/stats/espnStats";
+import { getEspnTeamShotAverages, getEspnTeamStats } from "../lib/stats/espnStats";
 import { findOddsFixture, type OddsFixture } from "../lib/stats/oddsApi";
-import type { MatchContext } from "../lib/stats/types";
+import type { MatchContext, Pick } from "../lib/stats/types";
 
 describe("probability engine", () => {
   it("normalizes a scoreline matrix", () => {
@@ -41,6 +47,11 @@ describe("probability engine", () => {
     const markets = deriveMarketProbabilities(context);
     expect(markets.home + markets.draw + markets.away).toBeCloseTo(1, 8);
     expect(markets.over[2.5] + markets.under[2.5]).toBeCloseTo(1, 8);
+    expect(markets.doubleChance.homeOrDraw).toBeCloseTo(markets.home + markets.draw, 8);
+    expect(markets.bttsYes + markets.bttsNo).toBeCloseTo(1, 8);
+    expect(markets.topCorrectScores).toHaveLength(3);
+    expect(markets.topCorrectScores[0].probability).toBeGreaterThanOrEqual(markets.topCorrectScores[1].probability);
+    expect(markets.topCorrectScores.every(({ score }) => /^\d+-\d+$/.test(score))).toBe(true);
   });
 
   it("removes bookmaker margin", () => {
@@ -92,6 +103,101 @@ describe("probability engine", () => {
     expect(extractRequestedMatch("Please analyse Nottingham Forest vs Chelsea tonight")).toEqual({
       home: "Nottingham Forest",
       away: "Chelsea",
+    });
+    expect(extractRequestedMatch("I want to analyse Chelsea vs Arsenal for goals")).toEqual({
+      home: "Chelsea",
+      away: "Arsenal",
+    });
+    expect(extractRequestedMatch("What about Chelsea vs Arsenal for all markets?")).toEqual({
+      home: "Chelsea",
+      away: "Arsenal",
+    });
+  });
+
+  it("only opens the board on explicit requests and recognizes distinct game counts", async () => {
+    const board = await classifyMessage("show analysis board");
+    const boardWithMe = await classifyMessage("show me the analysis board");
+    const slate = await classifyMessage("3 high-probability games tonight");
+    expect(board).toMatchObject({ intent: "show_board", openBoard: true });
+    expect(boardWithMe).toMatchObject({ intent: "show_board", openBoard: true });
+    expect(slate).toMatchObject({ intent: "best_plays", openBoard: false, limit: 3, distinctMatches: true });
+    expect((await classifyMessage("best goal picks today")).targetMarket).toBe("Over/Under Goals");
+    expect((await classifyMessage("check chelsea")).requestedTeam).toBe("chelsea");
+    expect((await classifyMessage("GG tonight")).targetMarket).toBe("BTTS");
+  });
+
+  it("reuses fixture context for market follow-ups", async () => {
+    const context = {
+      lastMatchedFixture: {
+        id: "follow-up-match",
+        sport_key: "soccer_epl",
+        commence_time: "2026-12-01T19:00:00Z",
+        home_team: "Chelsea",
+        away_team: "Arsenal",
+      },
+    };
+    const result = await classifyMessage("what about total shots?", context);
+    expect(result).toMatchObject({
+      intent: "analyse_match",
+      useContext: true,
+      targetMarket: "Total Shots",
+      limit: 1,
+    });
+    expect((await classifyMessage("for correct score", context)).targetMarket).toBe("Correct Score");
+    expect((await classifyMessage("for goals", context)).targetMarket).toBe("Over/Under Goals");
+  });
+
+  it("derives complementary Poisson probabilities for total shots", () => {
+    const probabilities = deriveShotMarketProbabilities(11, 12, 4, 4);
+    expect(probabilities).toBeDefined();
+    if (!probabilities) throw new Error("Expected valid shot probabilities.");
+    expect(probabilities.totalShots[21.5].over + probabilities.totalShots[21.5].under).toBeCloseTo(1, 12);
+    expect(probabilities?.totalShots[21.5].over).toBeGreaterThan(probabilities?.totalShots[25.5].over ?? 0);
+    expect(deriveShotMarketProbabilities(-1, 10, 4, 3)).toBeUndefined();
+  });
+
+  it("ranks only one highest-probability pick per distinct fixture", () => {
+    const picks: Pick[] = [
+      { match: "A vs B", market: "1X2", selection: "A", modelProb: 0.6, bookOdds: null, fairProb: null, edge: null, ev: null, confidence: "low", dataQuality: "model_only", justification: "" },
+      { match: "A vs B", market: "BTTS", selection: "Yes", modelProb: 0.7, bookOdds: null, fairProb: null, edge: null, ev: null, confidence: "low", dataQuality: "model_only", justification: "" },
+      { match: "C vs D", market: "1X2", selection: "C", modelProb: 0.5, bookOdds: null, fairProb: null, edge: null, ev: null, confidence: "low", dataQuality: "model_only", justification: "" },
+    ];
+    const ranked = rankPicks(picks, { limit: 2, sortBy: "probability", distinctMatches: true });
+    expect(ranked.map((pick) => pick.selection)).toEqual(["Yes", "C"]);
+  });
+
+  it("reads completed ESPN match shot data and averages real summary values", async () => {
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.headers).toMatchObject({ Accept: "application/json" });
+      return new Response(JSON.stringify({
+        boxscore: {
+          teams: [{
+            team: { displayName: "Sample United" },
+            statistics: [
+              { name: "totalShots", value: 14 },
+              { name: "shotsOnTarget", value: 6 },
+            ],
+          }],
+        },
+      }), { status: 200 });
+    });
+    const scoreboard = {
+      events: [{
+        id: "shot-summary-event",
+        date: "2026-11-25T19:00Z",
+        status: { type: { completed: true, state: "post" } },
+        competitions: [{
+          competitors: [
+            { homeAway: "home", team: { displayName: "Sample United" } },
+            { homeAway: "away", team: { displayName: "Other FC" } },
+          ],
+        }],
+      }],
+    };
+    await expect(getEspnTeamShotAverages("test.league", "Sample United", scoreboard)).resolves.toEqual({
+      totalShots: 14,
+      shotsOnTarget: 6,
+      games: 1,
     });
   });
 
@@ -159,6 +265,11 @@ describe("probability engine", () => {
     expect(picks.length).toBeGreaterThan(0);
     expect(picks.some((pick) => pick.bookOdds !== null)).toBe(true);
     expect(picks.some((pick) => pick.lowValue)).toBe(true);
+    expect(picks.some((pick) => pick.market === "Correct Score")).toBe(true);
+    expect(picks.filter((pick) => pick.market === "Correct Score")).toHaveLength(3);
+    expect(picks.some((pick) => pick.market === "Over/Under Goals" && pick.selection === "Over 1.5 Goals")).toBe(true);
+    expect(picks.some((pick) => pick.market === "Over/Under Goals" && pick.selection === "Under 3.5 Goals")).toBe(true);
+    expect(picks.some((pick) => pick.market === "Total Shots")).toBe(false);
     expect(picks.map((pick) => pick.ev ?? -Infinity)).toEqual(
       [...picks].map((pick) => pick.ev ?? -Infinity).sort((a, b) => b - a),
     );

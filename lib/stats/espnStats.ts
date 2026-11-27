@@ -22,12 +22,24 @@ interface EspnTeamEntry {
   stats?: Array<{ name?: string; displayName?: string; value?: string | number; displayValue?: string }>;
 }
 
+interface CompletedTeamEvent {
+  event: Record<string, unknown>;
+  isHome: boolean;
+}
+
+export interface TeamShotAverages {
+  totalShots: number;
+  shotsOnTarget: number;
+  games: number;
+}
+
 export interface EspnLeagueData {
   standings: unknown;
   scoreboard: unknown;
 }
 
 const cache = new Map<string, CacheEntry>();
+const shotAveragesCache = new Map<string, { expiresAt: number; value: TeamShotAverages | null }>();
 const TTL_MS = 6 * 60 * 60 * 1000;
 
 async function fetchEspnJson(url: string): Promise<unknown> {
@@ -37,6 +49,7 @@ async function fetchEspnJson(url: string): Promise<unknown> {
 
   const response = await fetch(url, {
     cache: "no-store",
+    headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(4000),
   });
   if (!response.ok) throw new Error(`ESPN stats request failed (${response.status}).`);
@@ -128,9 +141,9 @@ function toForm(form: string | undefined): number[] {
     .map((result) => result === "W" ? 1 : result === "D" ? 0.5 : 0);
 }
 
-function getScoreboardForm(scoreboard: unknown, teamName: string): number[] {
+function getCompletedTeamEvents(scoreboard: unknown, teamName: string, limit = 10): CompletedTeamEvent[] {
   if (!isRecord(scoreboard) || !Array.isArray(scoreboard.events)) return [];
-  const results: Array<{ date: number; form: number }> = [];
+  const results: Array<CompletedTeamEvent & { date: number }> = [];
   for (const rawEvent of scoreboard.events) {
     if (!isRecord(rawEvent)) continue;
     const event = rawEvent;
@@ -148,22 +161,99 @@ function getScoreboardForm(scoreboard: unknown, teamName: string): number[] {
       return typeof name === "string" && teamNameSimilarity(teamName, name) >= 0.62;
     });
     if (!matched) continue;
+    if (matched.homeAway !== "home" && matched.homeAway !== "away") continue;
+    const date = Date.parse(String(event.date ?? ""));
+    results.push({
+      event,
+      isHome: matched.homeAway === "home",
+      date: Number.isFinite(date) ? date : 0,
+    });
+  }
+  return results
+    .sort((a, b) => b.date - a.date)
+    .slice(0, limit);
+}
+
+function getScoreboardForm(scoreboard: unknown, teamName: string): number[] {
+  return getCompletedTeamEvents(scoreboard, teamName).flatMap(({ event, isHome }) => {
+    const competitions = Array.isArray(event.competitions) ? event.competitions : [];
+    const competition = competitions.find(isRecord);
+    if (!competition || !Array.isArray(competition.competitors)) return [];
+    const competitors = competition.competitors.filter(isRecord);
     const home = competitors.find((competitor) => competitor.homeAway === "home");
     const away = competitors.find((competitor) => competitor.homeAway === "away");
     const homeScore = Number(home?.score);
     const awayScore = Number(away?.score);
-    if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) continue;
-    const matchedIsHome = matched.homeAway === "home";
-    const teamScore = matchedIsHome ? homeScore : awayScore;
-    const opponentScore = matchedIsHome ? awayScore : homeScore;
-    const form = teamScore > opponentScore ? 1 : teamScore === opponentScore ? 0.5 : 0;
-    const date = Date.parse(String(event.date ?? ""));
-    results.push({ date: Number.isFinite(date) ? date : 0, form });
+    if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return [];
+    const teamScore = isHome ? homeScore : awayScore;
+    const opponentScore = isHome ? awayScore : homeScore;
+    return [teamScore > opponentScore ? 1 : teamScore === opponentScore ? 0.5 : 0];
+  });
+}
+
+function numericValue(value: unknown): number | undefined {
+  const parsed = Number(String(value ?? "").replace(/,/g, "").match(/-?\d+(?:\.\d+)?/)?.[0]);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function getSummaryShotStats(summary: unknown, teamName: string): Omit<TeamShotAverages, "games"> | undefined {
+  if (!isRecord(summary) || !isRecord(summary.boxscore) || !Array.isArray(summary.boxscore.teams)) return undefined;
+  const teams = summary.boxscore.teams.filter(isRecord);
+  const teamBox = teams.find((item) => {
+    if (!isRecord(item.team)) return false;
+    const name = item.team.displayName ?? item.team.name;
+    return typeof name === "string" && teamNameSimilarity(teamName, name) >= 0.62;
+  });
+  if (!teamBox || !Array.isArray(teamBox.statistics)) return undefined;
+  let totalShots: number | undefined;
+  let shotsOnTarget: number | undefined;
+  for (const rawStat of teamBox.statistics) {
+    if (!isRecord(rawStat)) continue;
+    const key = `${rawStat.name ?? ""} ${rawStat.displayName ?? ""} ${rawStat.abbreviation ?? ""}`
+      .toLowerCase()
+      .replace(/[^a-z]/g, "");
+    const value = numericValue(rawStat.value ?? rawStat.displayValue);
+    if (value === undefined) continue;
+    if (key.includes("shotontarget") || key.includes("shotsontarget")) shotsOnTarget = value;
+    else if (key.includes("totalshots") || key === "shots") totalShots = value;
   }
-  return results
-    .sort((a, b) => b.date - a.date)
-    .slice(0, 10)
-    .map((result) => result.form);
+  if (totalShots === undefined || shotsOnTarget === undefined) return undefined;
+  return { totalShots, shotsOnTarget };
+}
+
+export async function getEspnTeamShotAverages(
+  espnCode: string,
+  teamName: string,
+  scoreboard: unknown,
+): Promise<TeamShotAverages | undefined> {
+  const key = `${espnCode}:${teamName.toLowerCase()}`;
+  const cached = shotAveragesCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value ?? undefined;
+  if (cached) shotAveragesCache.delete(key);
+
+  const events = getCompletedTeamEvents(scoreboard, teamName, 5);
+  const summaries = await Promise.allSettled(events.flatMap(({ event }) => {
+    if (typeof event.id !== "string") return [];
+    const url = new URL(`https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(espnCode)}/summary`);
+    url.searchParams.set("event", event.id);
+    return [fetchEspnJson(url.toString())];
+  }));
+  const stats = summaries.flatMap((result) => {
+    if (result.status !== "fulfilled") return [];
+    const values = getSummaryShotStats(result.value, teamName);
+    return values ? [values] : [];
+  });
+  const value = stats.length === 0
+    ? null
+    : {
+        totalShots: stats.reduce((sum, item) => sum + item.totalShots, 0) / stats.length,
+        shotsOnTarget: stats.reduce((sum, item) => sum + item.shotsOnTarget, 0) / stats.length,
+        games: stats.length,
+      };
+  if (stats.length > 0 || summaries.some((result) => result.status === "fulfilled")) {
+    shotAveragesCache.set(key, { value, expiresAt: Date.now() + TTL_MS });
+  }
+  return value ?? undefined;
 }
 
 export function getEspnTeamStats(

@@ -17,7 +17,7 @@ export function ConfirmExtraction({ bets, onChange, onConfirm, onCancel, busy }:
       : bet));
   };
   return (
-    <div className="rounded-2xl border border-cyan-400/20 bg-cyan-400/[0.04] p-4">
+    <div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/[0.04] p-4">
       <h3 className="mb-3 font-semibold text-white">Confirm extracted bets</h3>
       <div className="space-y-2">
         {bets.map((bet, index) => (
@@ -30,7 +30,7 @@ export function ConfirmExtraction({ bets, onChange, onConfirm, onCancel, busy }:
         ))}
       </div>
       <div className="mt-4 flex gap-2">
-        <button type="button" onClick={onConfirm} disabled={busy} className="rounded-lg bg-cyan-400 px-4 py-2 text-sm font-bold text-[#091016] disabled:opacity-50">Analyse bets</button>
+        <button type="button" onClick={onConfirm} disabled={busy} className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-bold text-[#07120d] disabled:opacity-50">Analyse bets</button>
         <button type="button" onClick={onCancel} className="rounded-lg border border-white/10 px-4 py-2 text-sm text-slate-300">Cancel</button>
       </div>
     </div>
