@@ -162,6 +162,17 @@ describe("probability engine", () => {
     expect(picks.map((pick) => pick.ev ?? -Infinity)).toEqual(
       [...picks].map((pick) => pick.ev ?? -Infinity).sort((a, b) => b - a),
     );
+
+    const confirmedPicks = await analyseFixtures([{
+      ...fixture,
+      confirmedBets: [{ home: "Chelsea", away: "Arsenal", market: "h2h", selection: "Chelsea" }],
+    }], { limit: 50 });
+    const confirmedPick = confirmedPicks.find((pick) =>
+      pick.market === "h2h" && pick.selection === "Chelsea",
+    );
+    expect(confirmedPick?.modelProb).toBeGreaterThan(0);
+    expect(confirmedPick?.bookOdds).toBeNull();
+    expect(confirmedPick?.ev).toBeNull();
   });
 
   it("maps live ESPN standings and recent scoreboard form into team stats", () => {
