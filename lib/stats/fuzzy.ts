@@ -3,6 +3,7 @@ function normalize(value: string): string {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\bnott['’]?m\b/g, "nottingham")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 }
@@ -11,8 +12,17 @@ export function teamNameSimilarity(first: string, second: string): number {
   const left = normalize(first);
   const right = normalize(second);
   if (!left || !right) return 0;
-  const distance = levenshtein(left, right);
-  return 1 - distance / Math.max(left.length, right.length);
+  const leftTokens = left.split(" ");
+  const rightTokens = right.split(" ");
+  const shorter = leftTokens.length <= rightTokens.length ? leftTokens : rightTokens;
+  const longer = leftTokens.length <= rightTokens.length ? rightTokens : leftTokens;
+  const similarities = shorter.map((token) =>
+    Math.max(...longer.map((candidate) => {
+      const distance = levenshtein(token, candidate);
+      return 1 - distance / Math.max(token.length, candidate.length);
+    })),
+  );
+  return similarities.reduce((sum, score) => sum + score, 0) / similarities.length;
 }
 
 export function levenshtein(a: string, b: string): number {

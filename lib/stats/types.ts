@@ -54,4 +54,5 @@ export interface Pick {
   confidence: Confidence;
   justification: string;
   dataQuality: "complete" | "partial" | "insufficient" | "model_only" | "limited";
+  lowValue?: boolean;
 }

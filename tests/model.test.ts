@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { classifyIntent, extractPickLimit, extractRequestedMatch } from "../lib/ai/intent";
+import { analyseFixtures } from "../lib/model/analyseFixtures";
 import { buildScoreMatrix } from "../lib/model/poisson";
 import { deriveMarketProbabilities, matrixSum } from "../lib/model/markets";
 import { calculateValue, removeMargin } from "../lib/model/value";
@@ -38,6 +40,7 @@ describe("probability engine", () => {
     };
     const markets = deriveMarketProbabilities(context);
     expect(markets.home + markets.draw + markets.away).toBeCloseTo(1, 8);
+    expect(markets.over[2.5] + markets.under[2.5]).toBeCloseTo(1, 8);
   });
 
   it("removes bookmaker margin", () => {
@@ -68,6 +71,97 @@ describe("probability engine", () => {
     }];
     expect(findOddsFixture(fixtures, "Nott'm Forest", "Chelsea FC")?.id).toBe("fixture-1");
     expect(findOddsFixture(fixtures, "Arsenal", "Liverpool")).toBeUndefined();
+  });
+
+  it("matches requested teams in either fixture order", () => {
+    const fixtures: OddsFixture[] = [{
+      id: "fixture-reversed",
+      sport_key: "soccer_epl",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Werder Bremen",
+      away_team: "Borussia Monchengladbach",
+      bookmakers: [],
+    }];
+    expect(findOddsFixture(fixtures, "borrusia", "werder bremen")?.id).toBe("fixture-reversed");
+  });
+
+  it("recognizes best-play phrasing and requested match limits", async () => {
+    expect(await classifyIntent("Give me 4 games today")).toBe("best_plays");
+    expect(await classifyIntent("What are the safest picks?")).toBe("best_plays");
+    expect(extractPickLimit("Show me 12 picks")).toBe(12);
+    expect(extractRequestedMatch("Please analyse Nottingham Forest vs Chelsea tonight")).toEqual({
+      home: "Nottingham Forest",
+      away: "Chelsea",
+    });
+  });
+
+  it("ranks priced model picks and flags short prices", async () => {
+    vi.stubEnv("FOOTBALL_API_KEY", "");
+    vi.stubEnv("API_FOOTBALL_KEY", "");
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("LLM_API_KEY", "");
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      const isStandings = url.includes("/standings");
+      const payload = isStandings
+        ? {
+            children: [{
+              standings: {
+                entries: ["Chelsea", "Arsenal"].map((team, index) => ({
+                  team: { displayName: team },
+                  stats: [
+                    { name: "gamesPlayed", value: 10 },
+                    { name: "wins", value: index === 0 ? 7 : 5 },
+                    { name: "ties", value: 2 },
+                    { name: "losses", value: index === 0 ? 1 : 3 },
+                    { name: "pointsFor", value: index === 0 ? 22 : 16 },
+                    { name: "pointsAgainst", value: index === 0 ? 9 : 12 },
+                    { name: "rank", value: index + 1 },
+                    { name: "form", displayValue: "W-D-W-L-W" },
+                  ],
+                })),
+              },
+            }],
+          }
+        : { events: [] };
+      return new Response(JSON.stringify(payload), { status: 200 });
+    });
+
+    const fixture: OddsFixture = {
+      id: "ranked-fixture",
+      sport_key: "soccer_epl",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Chelsea",
+      away_team: "Arsenal",
+      bookmakers: [{
+        key: "test-book",
+        title: "Test Book",
+        markets: [
+          {
+            key: "h2h",
+            outcomes: [
+              { name: "Chelsea", price: 1.1 },
+              { name: "Draw", price: 4.2 },
+              { name: "Arsenal", price: 7 },
+            ],
+          },
+          {
+            key: "totals",
+            outcomes: [
+              { name: "Over", point: 2.5, price: 2 },
+              { name: "Under", point: 2.5, price: 1.9 },
+            ],
+          },
+        ],
+      }],
+    };
+    const picks = await analyseFixtures([fixture], { limit: 20 });
+    expect(picks.length).toBeGreaterThan(0);
+    expect(picks.some((pick) => pick.bookOdds !== null)).toBe(true);
+    expect(picks.some((pick) => pick.lowValue)).toBe(true);
+    expect(picks.map((pick) => pick.ev ?? -Infinity)).toEqual(
+      [...picks].map((pick) => pick.ev ?? -Infinity).sort((a, b) => b - a),
+    );
   });
 
   it("maps live ESPN standings and recent scoreboard form into team stats", () => {
@@ -122,5 +216,10 @@ describe("probability engine", () => {
       standingsPosition: 4,
       form: [1],
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 });
