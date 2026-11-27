@@ -453,7 +453,7 @@ export async function analyseFixtures(
 
   const allPicks = [...picksByKey.values()];
   if (options.singleBestPerMatch) {
-    return selectSingleBestPick(allPicks, {
+    return selectSingleBestPick(allPicks.filter((pick) => pick.dataQuality !== "limited"), {
       targetMarket: options.targetMarket ?? "all",
       limit,
     });

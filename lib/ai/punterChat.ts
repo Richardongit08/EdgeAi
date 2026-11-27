@@ -16,7 +16,7 @@ export function formatPunterPicks(picks: Pick[]): string {
 
 export async function answerPunterQuestion(question: string, evidence: Pick[]): Promise<string> {
   if (evidence.length === 0) {
-    return "I don't have a matching upcoming fixture or fetched team statistics for that question, so I can't give a data-backed verdict. Ask about a listed fixture or try again when live stats are available.";
+    return "I don't have sufficient fetched team statistics to give a grounded verdict for that question. Ask about a listed fixture or try again when live stats are available.";
   }
 
   try {

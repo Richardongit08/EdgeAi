@@ -49,7 +49,7 @@ function describePicks(picks: Pick[], fixtureCount: number): string {
   if (picks.length === 0) {
     return fixtureCount === 0
       ? "No upcoming fixtures with usable live odds are available in the next 36 hours."
-      : "I couldn't produce a valid pick from the available fixture data.";
+      : "No grounded pick is available: the fetched team statistics are insufficient for the requested market.";
   }
   return formatPunterPicks(picks);
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   classifyIntent,
   extractRequestedMatch,
@@ -6,6 +6,8 @@ import {
   shouldOpenAnalysisBoard,
 } from "../lib/ai/intent";
 import { selectSingleBestPick } from "../lib/model/selectBestPick";
+import { analyseFixtures } from "../lib/model/analyseFixtures";
+import type { OddsFixture } from "../lib/stats/oddsApi";
 import type { Pick } from "../lib/stats/types";
 
 const picks: Pick[] = [
@@ -76,6 +78,22 @@ describe("single best-pick selection", () => {
     expect(result).toHaveLength(1);
     expect(result[0].selection).toBe("Over 1.5");
   });
+
+  it("does not produce a conversational pick from league-average fallback data alone", async () => {
+    vi.stubEnv("FOOTBALL_API_KEY", "");
+    vi.stubEnv("API_FOOTBALL_KEY", "");
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ events: [] }), { status: 200 }));
+    const fixture: OddsFixture = {
+      id: "limited-data",
+      sport_key: "soccer_efl_champ",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Home Town",
+      away_team: "Away Town",
+      bookmakers: [],
+    };
+    const result = await analyseFixtures([fixture], { singleBestPerMatch: true });
+    expect(result).toEqual([]);
+  });
 });
 
 describe("punter conversation intent", () => {
@@ -93,4 +111,9 @@ describe("punter conversation intent", () => {
     expect(await classifyIntent("How should I structure a low-variance 3-fold?")).toBe("general");
     expect(await classifyIntent("For over/under")).toBe("analyse_match");
   });
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
