@@ -1,4 +1,4 @@
-import type { Pick } from "@/lib/stats/types";
+import type { Pick, TargetMarket } from "@/lib/stats/types";
 
 const HIGH_PROBABILITY_THRESHOLD = 0.5;
 
@@ -20,4 +20,27 @@ export function selectBestPick(picks: Pick[], targetMarket = "all"): Pick | unde
   }
 
   return [...picks].sort(compareProbability)[0];
+}
+
+export function selectSingleBestPick(
+  candidates: Pick[],
+  options?: { targetMarket?: TargetMarket; limit?: number },
+): Pick[] {
+  const targetMarket = options?.targetMarket;
+  const filtered = targetMarket !== undefined && targetMarket !== "all"
+    ? candidates.filter((pick) => pick.market.toLowerCase() === targetMarket.toLowerCase())
+    : candidates;
+  const bestByMatch = new Map<string, Pick>();
+
+  for (const candidate of filtered) {
+    const key = candidate.match.trim().toLowerCase();
+    const current = bestByMatch.get(key);
+    if (!current || compareProbability(candidate, current) < 0) {
+      bestByMatch.set(key, candidate);
+    }
+  }
+
+  const ranked = [...bestByMatch.values()].sort(compareProbability);
+  if (options?.limit === undefined) return ranked;
+  return ranked.slice(0, Math.max(0, Math.floor(options.limit)));
 }
