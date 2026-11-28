@@ -1,13 +1,15 @@
 import { GoogleGenAI } from "@google/genai";
 import type { ContentListUnion } from "@google/genai";
 
+const GEMINI_TIMEOUT_MS = 30_000;
+
 export function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY ||
     process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
     process.env.GOOGLE_API_KEY ||
     process.env.LLM_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
-  return new GoogleGenAI({ apiKey, httpOptions: { timeout: 6000 } });
+  return new GoogleGenAI({ apiKey, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
 }
 
 function shouldFallback(error: unknown): boolean {
@@ -38,7 +40,7 @@ export async function generateWithFallback(
       const response = await Promise.race([
         responsePromise,
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Gemini generation timed out")), 6000),
+          setTimeout(() => reject(new Error("Gemini generation timed out")), GEMINI_TIMEOUT_MS),
         ),
       ]);
       return response.text ?? "";
