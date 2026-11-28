@@ -28,6 +28,7 @@ export interface TelegramMessage {
   chat: { id: number | string };
   text?: string;
   caption?: string;
+  media_group_id?: string;
   photo?: Array<{ file_id: string }>;
   document?: { file_id: string; mime_type?: string };
   reply_to_message?: {
@@ -127,12 +128,99 @@ export function selectHighestProbabilityPick(picks: Pick[]): Pick | undefined {
   return selectBestPick(picks);
 }
 
+function formatMarketAndSelection(pick: Pick): { market: string; selection: string } {
+  const market = pick.market.trim().replace(/_/g, " ");
+  const normalizedMarket = market.toLowerCase();
+  const selection = pick.selection.trim();
+  const normalizedSelection = selection.toLowerCase();
+  const [home, away] = pick.match.split(/\s+vs\s+/i);
+  const picksSide = (team: string | undefined, side: "home" | "away") => {
+    if (!team) return false;
+    return new RegExp(`\\b${side}\\b`).test(normalizedSelection) ||
+      new RegExp(`^${side === "home" ? "1" : "2"}(?:\\s*\\(|$)`).test(normalizedSelection) ||
+      team.toLowerCase() === normalizedSelection ||
+      normalizedSelection.includes(team.toLowerCase());
+  };
+
+  if (normalizedMarket.includes("btts") || normalizedMarket.includes("both teams")) {
+    return { market: "BTTS", selection };
+  }
+  if (normalizedMarket.includes("double chance")) {
+    const outcome = /^(?:1x\b|home\s*(?:or|and)\s*draw|draw\s*(?:or|and)\s*home)/.test(normalizedSelection)
+      ? "1X (Home or Draw)"
+      : /^(?:x2\b|away\s*(?:or|and)\s*draw|draw\s*(?:or|and)\s*away)/.test(normalizedSelection)
+        ? "X2 (Draw or Away)"
+        : /^(?:12\b|home\s*(?:or|and)\s*away|away\s*(?:or|and)\s*home)/.test(normalizedSelection)
+          ? "12 (Home or Away)"
+          : selection;
+    return { market: "Double Chance", selection: outcome };
+  }
+  if (
+    normalizedMarket === "1x2" ||
+    normalizedMarket === "h2h" ||
+    normalizedMarket.includes("match result") ||
+    normalizedMarket.includes("match winner") ||
+    normalizedMarket.includes("full time result")
+  ) {
+    const outcome = /2up/.test(normalizedSelection) && /\bhome\b/.test(normalizedSelection)
+      ? "Home Win (1) / 2UP"
+      : /2up/.test(normalizedSelection) && /\baway\b/.test(normalizedSelection)
+        ? "Away Win (2) / 2UP"
+        : /draw|tie|^x$/.test(normalizedSelection)
+      ? "Draw (X)"
+      : picksSide(home, "home")
+        ? `Home Win (${home})`
+        : picksSide(away, "away")
+          ? `Away Win (${away})`
+          : selection;
+    return { market: "1X2", selection: outcome };
+  }
+  if (
+    normalizedMarket.includes("2nd half") ||
+    normalizedMarket.includes("second half")
+  ) {
+    return { market: "2nd Half Total Goals", selection };
+  }
+  if (normalizedMarket.includes("team total") || normalizedMarket.includes("team goals")) {
+    const team = market.replace(/team total goals|team goals/ig, "").trim();
+    return {
+      market: "Team Total Goals",
+      selection: `${team ? `${team} ` : ""}${selection.replace(/\s+goals?$/i, "")}`,
+    };
+  }
+  if (
+    normalizedMarket.includes("goals over/under") ||
+    normalizedMarket === "totals" ||
+    normalizedMarket.includes("total goals") ||
+    normalizedMarket.includes("total goal")
+  ) {
+    return { market: "Total Goals", selection: selection.replace(/\s+goals?$/i, "") };
+  }
+  if (normalizedMarket.includes("handicap") || normalizedMarket.includes("spread")) {
+    const handicap = selection.match(/[+-]\s*\d+(?:\.\d+)?/)?.[0].replace(/\s/g, "");
+    const team = picksSide(home, "home") ? home : picksSide(away, "away") ? away : undefined;
+    return {
+      market: "Handicap",
+      selection: team && handicap ? `${team} ${handicap}` : selection,
+    };
+  }
+  if (normalizedMarket.includes("correct score")) return { market: "Correct Score", selection };
+  if (normalizedMarket.includes("corner")) {
+    return { market: "Corners", selection: selection.replace(/\s+corners?$/i, "") };
+  }
+  if (normalizedMarket.includes("shot")) {
+    return { market: "Shots", selection: selection.replace(/\s+shots?$/i, "") };
+  }
+  return { market, selection };
+}
+
 export function formatBestPickMessages(picks: Pick[]): string[] {
   return picks.map((pick, index) => {
+    const formattedPick = formatMarketAndSelection(pick);
     const message = [
       `Match: ${pick.match}`,
       `Probability: ${(pick.modelProb * 100).toFixed(1)}%`,
-      `Pick: ${pick.selection}`,
+      `Pick: ${formattedPick.market} — ${formattedPick.selection}`,
       `odds: ${(pick.bookOdds !== null && Number.isFinite(pick.bookOdds) && pick.bookOdds > 1
         ? pick.bookOdds
         : 1 / Math.min(Math.max(pick.modelProb, 0.0001), 1)).toFixed(2)}`,
@@ -263,32 +351,51 @@ function fixtureForBet(bet: ExtractedBet, fixtures: OddsFixture[], index: number
       };
 }
 
-function getTelegramImage(message: TelegramMessage): TelegramImage | undefined {
+function isImageDocument(document: TelegramMessage["document"]): boolean {
+  return document !== undefined && (
+    document.mime_type?.startsWith("image/") === true ||
+    document.mime_type === "application/octet-stream"
+  );
+}
+
+function getTelegramImages(message: TelegramMessage): TelegramImage[] {
   const photo = message.photo?.at(-1);
-  if (photo) return { fileId: photo.file_id };
+  if (photo) return [{ fileId: photo.file_id }];
 
   const document = message.document;
-  if (document?.mime_type?.startsWith("image/")) {
-    return { fileId: document.file_id, mimeType: document.mime_type };
+  if (document && isImageDocument(document)) {
+    return [{ fileId: document.file_id, mimeType: document.mime_type }];
   }
 
   const replyPhoto = message.reply_to_message?.photo?.at(-1);
-  if (replyPhoto) return { fileId: replyPhoto.file_id };
+  if (replyPhoto) return [{ fileId: replyPhoto.file_id }];
 
   const replyDocument = message.reply_to_message?.document;
-  if (replyDocument?.mime_type?.startsWith("image/")) {
-    return { fileId: replyDocument.file_id, mimeType: replyDocument.mime_type };
+  if (replyDocument && isImageDocument(replyDocument)) {
+    return [{ fileId: replyDocument.file_id, mimeType: replyDocument.mime_type }];
   }
+  return [];
 }
 
 export function hasTelegramImage(message: TelegramMessage): boolean {
-  return getTelegramImage(message) !== undefined;
+  return getTelegramImages(message).length > 0;
 }
 
-async function photoReply(
+function resolveTelegramImageMimeType(documentMimeType: string | undefined, filePath: string): string {
+  const declaredMimeType = documentMimeType?.split(";")[0].trim().toLowerCase();
+  if (
+    declaredMimeType === "image/jpeg" ||
+    declaredMimeType === "image/png" ||
+    declaredMimeType === "image/webp"
+  ) return declaredMimeType;
+  if (/\.png$/i.test(filePath)) return "image/png";
+  if (/\.webp$/i.test(filePath)) return "image/webp";
+  return "image/jpeg";
+}
+
+async function downloadTelegramImage(
   telegramImage: TelegramImage,
-  instructionText: string,
-): Promise<string[]> {
+): Promise<{ base64Image: string; mimeType: string }> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   const file = await telegramApi<TelegramFile>(
@@ -309,24 +416,45 @@ async function photoReply(
   if (image.byteLength > MAX_IMAGE_BYTES) {
     throw new Error("Bet-slip images must be smaller than 10 MB.");
   }
+  return {
+    base64Image: Buffer.from(image).toString("base64"),
+    mimeType: resolveTelegramImageMimeType(telegramImage.mimeType, file.file_path),
+  };
+}
 
-  const responseMimeType = response.headers.get("content-type")?.split(";")[0];
-  const mimeType = responseMimeType?.startsWith("image/")
-    ? responseMimeType
-    : telegramImage.mimeType ?? "image/jpeg";
+function normalizedFixtureKey(bet: ExtractedBet): string {
+  const normalizeTeam = (team: string) =>
+    team.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+  return `${normalizeTeam(bet.home)} vs ${normalizeTeam(bet.away)}`;
+}
+
+async function photoReply(
+  telegramImages: TelegramImage[],
+  instructionText: string,
+): Promise<string[]> {
+  const images = await Promise.all(telegramImages.map(downloadTelegramImage));
   const bets = extractedBetSchema.array().parse(
-    await extractBetsFromImage(Buffer.from(image).toString("base64"), mimeType),
+    images.length === 1
+      ? await extractBetsFromImage(images[0].base64Image, images[0].mimeType)
+      : await extractBetsFromImage(images),
   );
   if (bets.length === 0) {
     return plainReply("I couldn't read the team names clearly from that screenshot. Send it as an uncompressed File or split it into 2 shorter screenshots and I'll rank the top options.");
   }
 
+  const seenFixtures = new Set<string>();
+  const uniqueBets = bets.filter((bet) => {
+    const key = normalizedFixtureKey(bet);
+    if (seenFixtures.has(key)) return false;
+    seenFixtures.add(key);
+    return true;
+  });
   const availableFixtures = await getUpcomingOddsFixtures();
-  const fixtureBets = bets.map((bet, index) => fixtureForBet(bet, availableFixtures, index));
+  const fixtureBets = uniqueBets.map((bet, index) => fixtureForBet(bet, availableFixtures, index));
   const analyses = await Promise.all(fixtureBets.map((fixture) =>
     analyseFixtures([fixture], { limit: MAX_PICKS_PER_FIXTURE }),
   ));
-  const scoredPicks = bets.flatMap((bet, index) => {
+  const scoredPicks = uniqueBets.flatMap((bet, index) => {
     const fixture = fixtureBets[index];
     const matchName = `${fixture.home_team} vs ${fixture.away_team}`;
     const pick = analyses[index].find((candidate) =>
@@ -341,16 +469,24 @@ async function photoReply(
   }
 
   const limit = extractPickLimit(instructionText) ?? 10;
-  const rankedPicks = selectSingleBestPick(scoredPicks, { limit });
+  const rankedPicks = selectSingleBestPick(scoredPicks)
+    .sort((a, b) => b.modelProb - a.modelProb)
+    .slice(0, limit);
   return formatBestPickMessages(rankedPicks);
 }
 
-export async function createTelegramReplyMessages(message: TelegramMessage): Promise<string[]> {
-  const image = getTelegramImage(message);
-  if (image) {
-    const instructionText = message.caption || message.text || message.reply_to_message?.caption || "";
-    return photoReply(image, instructionText);
+export async function createTelegramReplyMessages(
+  messageOrMessages: TelegramMessage | TelegramMessage[],
+): Promise<string[]> {
+  const messages = Array.isArray(messageOrMessages) ? messageOrMessages : [messageOrMessages];
+  const images = messages.flatMap(getTelegramImages);
+  if (images.length > 0) {
+    const instructionText = messages
+      .map((message) => message.caption || message.text || message.reply_to_message?.caption || "")
+      .find((text) => text.length > 0) ?? "";
+    return photoReply(images, instructionText);
   }
+  const message = messages[0];
   if (typeof message.text === "string" && message.text.trim()) {
     return textReply(message.text.trim());
   }

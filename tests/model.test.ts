@@ -351,9 +351,35 @@ describe("probability engine", () => {
     const confirmedPick = confirmedPicks.find((pick) =>
       pick.market === "h2h" && pick.selection === "Chelsea",
     );
-    expect(confirmedPick?.modelProb).toBeGreaterThan(0);
-    expect(confirmedPick?.bookOdds).toBeNull();
-    expect(confirmedPick?.ev).toBeNull();
+    expect(confirmedPick).toBeDefined();
+    if (!confirmedPick) throw new Error("Expected confirmed bet pick to be analyzed.");
+    expect(confirmedPick.modelProb).toBeGreaterThanOrEqual(0.56);
+    expect(confirmedPick.modelProb).toBeLessThanOrEqual(0.83);
+    expect(confirmedPick.bookOdds).toBe(
+      Math.max(1.18, Number((1 / (confirmedPick.modelProb * 1.06)).toFixed(2))),
+    );
+    expect(confirmedPick.ev).not.toBeNull();
+
+    const confirmedWithOdds = await analyseFixtures([{
+      ...fixture,
+      confirmedBets: [{
+        home: "Chelsea",
+        away: "Arsenal",
+        market: "h2h",
+        selection: "Chelsea",
+        odds: 2,
+      }],
+    }], { limit: 50 });
+    const bookmakerPick = confirmedWithOdds.find((pick) =>
+      pick.market === "h2h" && pick.selection === "Chelsea",
+    );
+    const modelPick = picks.find((pick) =>
+      pick.market === "1X2" && pick.selection === "Chelsea",
+    );
+    expect(modelPick).toBeDefined();
+    if (!modelPick) throw new Error("Expected model pick to compare with bookmaker odds.");
+    expect(bookmakerPick?.modelProb).toBeCloseTo((modelPick.modelProb * 0.7) + 0.15);
+    expect(bookmakerPick?.bookOdds).toBe(2);
   });
 
   it("maps live ESPN standings and recent scoreboard form into team stats", () => {

@@ -14,6 +14,16 @@ export const dynamic = "force-dynamic";
 const processedUpdateIds = new Set<number>();
 const MAX_PROCESSED_UPDATES = 500;
 
+interface PendingTelegramMediaGroup {
+  messages: TelegramMessage[];
+  processing: boolean;
+  completion: Promise<void>;
+  resolve: () => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingMediaGroups = new Map<string, PendingTelegramMediaGroup>();
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -53,6 +63,7 @@ function parseTelegramMessage(value: unknown): TelegramMessage | undefined {
     chat: { id: chatId },
     text: typeof value.text === "string" ? value.text : undefined,
     caption: typeof value.caption === "string" ? value.caption : undefined,
+    media_group_id: typeof value.media_group_id === "string" ? value.media_group_id : undefined,
     photo,
     document,
     reply_to_message: replyValue
@@ -63,6 +74,59 @@ function parseTelegramMessage(value: unknown): TelegramMessage | undefined {
         }
       : undefined,
   };
+}
+
+function conciseErrorReason(error: unknown): string {
+  return error instanceof Error ? error.message.slice(0, 120) : "Unknown error";
+}
+
+async function sendImageError(chatId: number | string, error: unknown): Promise<void> {
+  console.error("[telegram-image-error]", error);
+  await sendTelegramMessage(chatId, `I couldn't process that message: ${conciseErrorReason(error)}`);
+}
+
+function queueTelegramMediaGroup(
+  chatId: number | string,
+  mediaGroupId: string,
+  message: TelegramMessage,
+): Promise<void> {
+  const key = `${chatId}:${mediaGroupId}`;
+  const existing = pendingMediaGroups.get(key);
+  if (existing) {
+    if (!existing.processing) existing.messages.push(message);
+    return existing.completion;
+  }
+
+  let resolve!: () => void;
+  const completion = new Promise<void>((complete) => {
+    resolve = complete;
+  });
+  const group: PendingTelegramMediaGroup = {
+    messages: [message],
+    processing: false,
+    completion,
+    resolve,
+    timer: setTimeout(() => {
+      group.processing = true;
+      pendingMediaGroups.delete(key);
+      void (async () => {
+        try {
+          await sendTelegramMessage(chatId, "Analysing your bet slip...");
+          await sendTelegramMessages(chatId, await createTelegramReplyMessages(group.messages));
+        } catch (error) {
+          try {
+            await sendImageError(chatId, error);
+          } catch (notificationError) {
+            console.error("[telegram-image-error]", notificationError);
+          }
+        } finally {
+          group.resolve();
+        }
+      })();
+    }, 1500),
+  };
+  pendingMediaGroups.set(key, group);
+  return completion;
 }
 
 function rememberUpdate(updateId: number): void {
@@ -115,17 +179,26 @@ export async function POST(request: NextRequest) {
     }
 
     if (hasImage) {
-      await sendTelegramMessage(chatId, "Analysing your bet slip...");
+      if (message.media_group_id) {
+        await queueTelegramMediaGroup(chatId, message.media_group_id, message);
+      } else {
+        await sendTelegramMessage(chatId, "Analysing your bet slip...");
+        await sendTelegramMessages(chatId, await createTelegramReplyMessages(message));
+      }
     } else {
       await sendTelegramChatAction(chatId);
+      await sendTelegramMessages(chatId, await createTelegramReplyMessages(message));
     }
-    await sendTelegramMessages(chatId, await createTelegramReplyMessages(message));
     return NextResponse.json({ ok: true });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Could not process Telegram update.";
+    console.error("[telegram-image-error]", error);
     if (chatId !== undefined) {
       try {
-        await sendTelegramMessage(chatId, "I couldn't process that message. Please try again.");
+        await sendTelegramMessage(
+          chatId,
+          `I couldn't process that message: ${conciseErrorReason(error)}`,
+        );
         return NextResponse.json({ ok: true });
       } catch (notificationError) {
         const notificationDetail = notificationError instanceof Error
