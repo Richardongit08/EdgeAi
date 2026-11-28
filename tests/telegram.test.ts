@@ -7,7 +7,7 @@ import {
   sendTelegramMessages,
   splitTelegramMessage,
 } from "../lib/channels/telegram";
-import { selectBestPick } from "../lib/model/selectBestPick";
+import { selectBestPick, selectSingleBestPick } from "../lib/model/selectBestPick";
 import { GET, POST } from "../src/app/api/telegram/route";
 import type { Pick } from "../lib/stats/types";
 
@@ -74,6 +74,24 @@ describe("Telegram reply helpers", () => {
       pricedHighProbability,
       pricedLowProbability,
     ])).toBe(pricedHighProbability);
+  });
+
+  it("selects one highest-probability pick per match, with market and limit options", () => {
+    const highProbability = pick("Home", 0.72);
+    const probabilityTieHigherEv = { ...pick("Draw", 0.72), ev: 0.6 };
+    const otherMatch = { ...pick("Away", 0.65), match: "Liverpool vs Brighton" };
+    const wrongMarket = { ...pick("Over 2.5", 0.95), market: "Goals Over/Under 2.5" };
+
+    expect(selectSingleBestPick([
+      pick("Home", 0.61),
+      highProbability,
+      probabilityTieHigherEv,
+      otherMatch,
+      wrongMarket,
+    ], { targetMarket: "1x2", limit: 1 })).toEqual([probabilityTieHigherEv]);
+    expect(selectSingleBestPick([highProbability, wrongMarket], { targetMarket: "all" })).toEqual([
+      wrongMarket,
+    ]);
   });
 
   it("sends a batch as sequential, separate Telegram messages", async () => {

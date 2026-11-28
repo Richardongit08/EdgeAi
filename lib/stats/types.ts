@@ -21,6 +21,10 @@ export interface TeamStats {
   losses?: number;
   goalsFor?: number;
   goalsAgainst?: number;
+  shotsFor?: number;
+  shotsAgainst?: number;
+  shotsOnTargetFor?: number;
+  shotsOnTargetAgainst?: number;
   goalsForHome: number;
   goalsAgainstHome: number;
   goalsForAway: number;
