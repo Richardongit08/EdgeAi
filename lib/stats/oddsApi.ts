@@ -11,6 +11,7 @@ export interface OddsFixture {
   commence_time: string;
   home_team: string;
   away_team: string;
+  modelPriced?: boolean;
   bookmakers: Array<{
     key: string;
     title: string;
@@ -23,6 +24,20 @@ export interface OddsFixture {
 
 const cache = new Map<string, CacheEntry<OddsFixture[]>>();
 const TTL_MS = 30 * 60 * 1000;
+const ESPN_FALLBACK_CACHE_TTL_MS = 5 * 60 * 1000;
+const ESPN_FALLBACK_LEAGUES = [
+  { sportKey: "soccer_epl", espnCode: "eng.1" },
+  { sportKey: "soccer_spain_la_liga", espnCode: "esp.1" },
+  { sportKey: "soccer_italy_serie_a", espnCode: "ita.1" },
+  { sportKey: "soccer_germany_bundesliga", espnCode: "ger.1" },
+  { sportKey: "soccer_france_ligue_one", espnCode: "fra.1" },
+  { sportKey: "soccer_uefa_champs_league", espnCode: "uefa.champions" },
+  { sportKey: "soccer_uefa_europa_league", espnCode: "uefa.europa" },
+  { sportKey: "soccer_efl_champ", espnCode: "eng.2" },
+  { sportKey: "soccer_netherlands_eredivisie", espnCode: "ned.1" },
+  { sportKey: "soccer_portugal_primeira_liga", espnCode: "por.1" },
+] as const;
+let espnFallbackCache: CacheEntry<OddsFixture[]> | undefined;
 export const ODDS_SPORT_KEYS = [
   "soccer_epl",
   "soccer_efl_champ",
@@ -93,11 +108,124 @@ export async function getLiveOdds(sportKey: string): Promise<OddsFixture[]> {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function nextScoreboardDates(now: number): string[] {
+  const date = new Date(now);
+  date.setUTCHours(0, 0, 0, 0);
+  return Array.from({ length: 3 }, (_, index) => {
+    const scoreboardDate = new Date(date);
+    scoreboardDate.setUTCDate(scoreboardDate.getUTCDate() + index);
+    return scoreboardDate.toISOString().slice(0, 10).replace(/-/g, "");
+  });
+}
+
+async function fetchEspnScoreboard(
+  espnCode: string,
+  date: string,
+): Promise<unknown> {
+  const url = new URL(
+    `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(espnCode)}/scoreboard`,
+  );
+  url.searchParams.set("dates", date);
+  url.searchParams.set("limit", "100");
+  const response = await fetch(url, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(6000),
+  });
+  if (!response.ok) return null;
+  return response.json() as Promise<unknown>;
+}
+
+function parseEspnFixture(
+  value: unknown,
+  sportKey: string,
+  now: number,
+  end: number,
+): OddsFixture | undefined {
+  if (!isRecord(value) || typeof value.date !== "string") return undefined;
+  const kickoff = Date.parse(value.date);
+  if (!Number.isFinite(kickoff) || kickoff < now || kickoff > end) return undefined;
+  const competition = Array.isArray(value.competitions)
+    ? value.competitions.find(isRecord)
+    : undefined;
+  const competitors = competition && Array.isArray(competition.competitors)
+    ? competition.competitors.filter(isRecord)
+    : [];
+  const getTeamName = (competitor: Record<string, unknown> | undefined): string | undefined => {
+    if (!competitor || !isRecord(competitor.team)) return undefined;
+    const team = competitor.team;
+    const name = team.displayName ?? team.name ?? team.shortDisplayName;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  };
+  const home = competitors.find((competitor) => competitor.homeAway === "home");
+  const away = competitors.find((competitor) => competitor.homeAway === "away");
+  const homeName = getTeamName(home);
+  const awayName = getTeamName(away);
+  if (!homeName || !awayName) return undefined;
+
+  const id = typeof value.id === "string"
+    ? `${sportKey}-${value.id}`
+    : `${sportKey}-${kickoff}-${homeName}-${awayName}`;
+  return {
+    id,
+    sport_key: sportKey,
+    commence_time: value.date,
+    home_team: homeName,
+    away_team: awayName,
+    modelPriced: true,
+    bookmakers: [],
+  };
+}
+
+async function getUpcomingEspnFixtures(): Promise<OddsFixture[]> {
+  const now = Date.now();
+  const end = now + 36 * 60 * 60 * 1000;
+  if (!espnFallbackCache || espnFallbackCache.expiresAt <= now) {
+    const dates = nextScoreboardDates(now);
+    const requests = ESPN_FALLBACK_LEAGUES.flatMap((league) =>
+      dates.map(async (date) => ({
+        league,
+        payload: await fetchEspnScoreboard(league.espnCode, date),
+      })),
+    );
+    const results = await Promise.allSettled(requests);
+    const fixtures = results.flatMap((result) => {
+      if (result.status !== "fulfilled" || !isRecord(result.value.payload) ||
+        !Array.isArray(result.value.payload.events)) return [];
+      return result.value.payload.events.flatMap((event) => {
+        const fixture = parseEspnFixture(
+          event,
+          result.value.league.sportKey,
+          now,
+          end,
+        );
+        return fixture ? [fixture] : [];
+      });
+    });
+    espnFallbackCache = {
+      value: [...new Map(fixtures.map((fixture) => [fixture.id, fixture])).values()],
+      expiresAt: now + ESPN_FALLBACK_CACHE_TTL_MS,
+    };
+  }
+
+  const refreshedNow = Date.now();
+  const refreshedEnd = refreshedNow + 36 * 60 * 60 * 1000;
+  return espnFallbackCache.value
+    .filter((fixture) => {
+      const kickoff = Date.parse(fixture.commence_time);
+      return kickoff >= refreshedNow && kickoff <= refreshedEnd;
+    })
+    .sort((a, b) => Date.parse(a.commence_time) - Date.parse(b.commence_time));
+}
+
 export async function getUpcomingOddsFixtures(): Promise<OddsFixture[]> {
   const results = await Promise.allSettled(ODDS_SPORT_KEYS.map((sportKey) => getLiveOdds(sportKey)));
   const now = Date.now();
   const end = now + 36 * 60 * 60 * 1000;
-  return results.flatMap((result) =>
+  const liveFixtures = results.flatMap((result) =>
     result.status === "fulfilled"
       ? result.value.filter((fixture) => {
           const kickoff = Date.parse(fixture.commence_time);
@@ -105,6 +233,7 @@ export async function getUpcomingOddsFixtures(): Promise<OddsFixture[]> {
         })
       : [],
   ).sort((a, b) => Date.parse(a.commence_time) - Date.parse(b.commence_time));
+  return liveFixtures.length > 0 ? liveFixtures : getUpcomingEspnFixtures();
 }
 
 export function findOddsFixture(fixtures: OddsFixture[], homeName: string, awayName: string): OddsFixture | undefined {

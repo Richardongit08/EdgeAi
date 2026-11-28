@@ -1,4 +1,9 @@
-import { classifyIntent, extractPickLimit, extractRequestedMatch } from "@/lib/ai/intent";
+import {
+  classifyIntent,
+  extractPickLimit,
+  extractRequestedMatch,
+  extractTargetMarket,
+} from "@/lib/ai/intent";
 import { extractBetsFromImage } from "@/lib/ai/extract";
 import { analyseFixtures, type FixtureWithOdds } from "@/lib/model/analyseFixtures";
 import { selectBestPick, selectSingleBestPick } from "@/lib/model/selectBestPick";
@@ -49,7 +54,10 @@ async function telegramApi<T>(method: string, init?: RequestInit): Promise<T> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
 
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, init);
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    ...init,
+    signal: init?.signal ?? AbortSignal.timeout(15_000),
+  });
   const payload = await response.json() as TelegramApiResponse<T>;
   if (!response.ok || !payload.ok || payload.result === undefined) {
     throw new Error(payload.description ?? `Telegram ${method} request failed.`);
@@ -144,6 +152,8 @@ async function textReply(text: string): Promise<string[]> {
     return plainReply("Ask for the best plays or name a match (Team A vs Team B). You can also upload a bet-slip screenshot for analysis.");
   }
 
+  const targetMarket = extractTargetMarket(text);
+  const fixtureLimit = extractPickLimit(text) ?? 6;
   const fixtures = await getUpcomingOddsFixtures();
   if (intent === "analyse_match") {
     const requestedMatch = extractRequestedMatch(text);
@@ -159,10 +169,21 @@ async function textReply(text: string): Promise<string[]> {
       : plainReply("No statistical picks are available for that match right now.");
   }
 
-  const fixtureLimit = extractPickLimit(text) ?? 6;
+  if (targetMarket !== "all") {
+    if (fixtures.length === 0) return plainReply("No upcoming fixtures are scheduled in the next 36 hours.");
+    const marketPicks = await analyseFixtures(fixtures, {
+      limit: fixtureLimit,
+      singleBestPerMatch: true,
+      targetMarket,
+    });
+    return marketPicks.length
+      ? formatBestPickMessages(marketPicks)
+      : plainReply("No picks are available for that market in the next 36 hours.");
+  }
+
   const upcomingFixtures = fixtures.slice(0, fixtureLimit);
   if (upcomingFixtures.length === 0) {
-    return plainReply("No upcoming fixtures with odds are available to analyse. Check ODDS_API_KEY and try again.");
+    return plainReply("No upcoming fixtures are scheduled in the next 36 hours.");
   }
 
   const picksByFixture = await Promise.all(upcomingFixtures.map((fixture) =>
@@ -213,6 +234,10 @@ function getTelegramImage(message: TelegramMessage): TelegramImage | undefined {
   }
 }
 
+export function hasTelegramImage(message: TelegramMessage): boolean {
+  return getTelegramImage(message) !== undefined;
+}
+
 async function photoReply(
   telegramImage: TelegramImage,
   instructionText: string,
@@ -226,6 +251,7 @@ async function photoReply(
 
   const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`, {
     cache: "no-store",
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error("Could not download the Telegram image.");
   const contentLength = Number(response.headers.get("content-length"));
@@ -245,7 +271,7 @@ async function photoReply(
     await extractBetsFromImage(Buffer.from(image).toString("base64"), mimeType),
   );
   if (bets.length === 0) {
-    return plainReply("I couldn't read the team names clearly from that screenshot. Send a clearer or split screenshot and I'll rank the top options.");
+    return plainReply("I couldn't read the team names clearly from that screenshot. Send it as an uncompressed File or split it into 2 shorter screenshots and I'll rank the top options.");
   }
 
   const availableFixtures = await getUpcomingOddsFixtures();

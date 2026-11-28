@@ -48,7 +48,7 @@ function findMentionedFixtures(fixtures: OddsFixture[], message: string): OddsFi
 function describePicks(picks: Pick[], fixtureCount: number): string {
   if (picks.length === 0) {
     return fixtureCount === 0
-      ? "No upcoming fixtures with usable live odds are available in the next 36 hours."
+      ? "No upcoming fixtures are scheduled in the next 36 hours."
       : "No grounded pick is available: the fetched team statistics are insufficient for the requested market.";
   }
   return formatPunterPicks(picks);

@@ -11,7 +11,7 @@ import {
 } from "../lib/channels/telegram";
 import { analyseFixtures } from "../lib/model/analyseFixtures";
 import { selectBestPick, selectSingleBestPick } from "../lib/model/selectBestPick";
-import { getUpcomingOddsFixtures } from "../lib/stats/oddsApi";
+import { getUpcomingOddsFixtures, type OddsFixture } from "../lib/stats/oddsApi";
 import { GET, POST } from "../src/app/api/telegram/route";
 import type { ExtractedBet, Pick } from "../lib/stats/types";
 
@@ -99,6 +99,43 @@ function stubTelegramImageDownload(contentType = "application/octet-stream"): st
     throw new Error(`Unexpected fetch: ${url}`);
   });
   return requestedUrls;
+}
+
+function stubTelegramWebhookFetch(): { sentMessages: string[]; requestedUrls: string[] } {
+  const sentMessages: string[] = [];
+  const requestedUrls: string[] = [];
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input.toString();
+    requestedUrls.push(url);
+    if (url.includes("/sendMessage")) {
+      const body = JSON.parse(String(init?.body)) as { text: string };
+      sentMessages.push(body.text);
+      return new Response(JSON.stringify({
+        ok: true,
+        result: { message_id: sentMessages.length },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.includes("/getFile?file_id=")) {
+      return new Response(JSON.stringify({
+        ok: true,
+        result: { file_path: "photos/slip.jpg" },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.includes("/file/bot")) {
+      return new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { "content-type": "application/octet-stream" },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  });
+  return { sentMessages, requestedUrls };
 }
 
 describe("Telegram reply helpers", () => {
@@ -248,11 +285,117 @@ describe("Telegram reply helpers", () => {
     });
 
     expect(messages).toEqual([
-      "I couldn't read the team names clearly from that screenshot. Send a clearer or split screenshot and I'll rank the top options.",
+      "I couldn't read the team names clearly from that screenshot. Send it as an uncompressed File or split it into 2 shorter screenshots and I'll rank the top options.",
     ]);
     expect(requestedUrls[0]).toContain("file_id=large-photo");
     expect(getUpcomingOddsFixtures).not.toHaveBeenCalled();
     expect(analyseFixtures).not.toHaveBeenCalled();
+  });
+
+  it("filters and limits Telegram picks for numbered market-game requests", async () => {
+    const fixtures: OddsFixture[] = [{
+      id: "market-fixture",
+      sport_key: "soccer_epl",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Arsenal",
+      away_team: "Chelsea",
+      bookmakers: [],
+    }];
+    const queries = [
+      ["6 correct score games", "correct_score", "Correct Score", "1-0", 6],
+      ["5 over/under games", "goals", "Goals Over/Under 2.5", "Over 2.5", 5],
+      ["4 btts games", "btts", "BTTS", "Yes", 4],
+      ["3 total shots games", "total_shots", "Total Shots", "Over 22.5 Shots", 3],
+      ["5 double chance games", "double_chance", "Double Chance", "1X", 5],
+    ] as const;
+
+    for (const [query, targetMarket, market, selection, limit] of queries) {
+      vi.mocked(getUpcomingOddsFixtures).mockResolvedValue(fixtures);
+      vi.mocked(analyseFixtures).mockResolvedValue([{
+        ...pick(selection, 0.72),
+        market,
+      }]);
+
+      const messages = await createTelegramReplyMessages({
+        chat: { id: 123 },
+        text: query,
+      });
+
+      expect(analyseFixtures).toHaveBeenCalledWith(fixtures, {
+        limit,
+        singleBestPerMatch: true,
+        targetMarket,
+      });
+      expect(messages).toHaveLength(1);
+      expect(messages[0].split("\n").slice(0, 4)).toEqual([
+        "Match: Arsenal vs Chelsea",
+        "Probability: 72.0%",
+        `Pick: ${selection}`,
+        "odds: 2.15",
+      ]);
+      vi.clearAllMocks();
+    }
+  });
+
+  it("acknowledges and analyzes a replied-to image document from a Telegram webhook", async () => {
+    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "test-secret");
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    vi.stubEnv("ODDS_API_KEY", "");
+    const { sentMessages, requestedUrls } = stubTelegramWebhookFetch();
+    configureSlipAnalysis(createSlipBets(1));
+
+    const response = await POST(new NextRequest("https://edgeai.example/api/telegram", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-telegram-bot-api-secret-token": "test-secret",
+      },
+      body: JSON.stringify({
+        update_id: 712034,
+        message: {
+          chat: { id: 123 },
+          text: "5 correct score games",
+          reply_to_message: {
+            caption: "Analyse this slip",
+            document: { file_id: "reply-document", mime_type: "image/png" },
+          },
+        },
+      }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(sentMessages[0]).toBe("Analysing your bet slip...");
+    expect(sentMessages[1]).toContain("Match: Home 0 vs Away 0");
+    expect(requestedUrls.some((url) => url.includes("file_id=reply-document"))).toBe(true);
+    expect(extractBetsFromImage).toHaveBeenCalledWith("AQID", "image/png");
+  });
+
+  it("notifies the chat if Telegram image processing throws", async () => {
+    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "test-secret");
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    const { sentMessages } = stubTelegramWebhookFetch();
+    vi.mocked(extractBetsFromImage).mockRejectedValue(new Error("vision request failed"));
+
+    const response = await POST(new NextRequest("https://edgeai.example/api/telegram", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-telegram-bot-api-secret-token": "test-secret",
+      },
+      body: JSON.stringify({
+        update_id: 712035,
+        message: {
+          chat: { id: 123 },
+          document: { file_id: "broken-image", mime_type: "image/jpeg" },
+        },
+      }),
+    }));
+
+    expect(response.status).toBe(200);
+    expect(sentMessages).toEqual([
+      "Analysing your bet slip...",
+      "I couldn't process that message. Please try again.",
+    ]);
   });
 
   it("sends a batch as sequential, separate Telegram messages", async () => {

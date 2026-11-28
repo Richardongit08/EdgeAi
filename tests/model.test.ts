@@ -6,7 +6,12 @@ import { deriveMarketProbabilities, matrixSum } from "../lib/model/markets";
 import { calculateValue, removeMargin } from "../lib/model/value";
 import { fuzzyTeamMatch, levenshtein } from "../lib/stats/fuzzy";
 import { getEspnTeamStats, leagueAverageTeamStats } from "../lib/stats/espnStats";
-import { findOddsFixture, getMarketOdds, type OddsFixture } from "../lib/stats/oddsApi";
+import {
+  findOddsFixture,
+  getMarketOdds,
+  getUpcomingOddsFixtures,
+  type OddsFixture,
+} from "../lib/stats/oddsApi";
 import type { MatchContext } from "../lib/stats/types";
 
 describe("probability engine", () => {
@@ -155,10 +160,106 @@ describe("probability engine", () => {
     expect(getMarketOdds(fixture, "1X", "Double Chance")).toBeCloseTo(1 / (1 / 2.1 + 1 / 3.2), 8);
   });
 
+  it("falls back to ESPN fixtures when The Odds API is quota-limited and model-prices the picks", async () => {
+    vi.stubEnv("ODDS_API_KEY", "quota-limited-key");
+    const kickoff = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const event = {
+      id: "espn-epl-fixture",
+      date: kickoff,
+      competitions: [{
+        competitors: [
+          { homeAway: "home", team: { displayName: "Chelsea" } },
+          { homeAway: "away", team: { displayName: "Arsenal" } },
+        ],
+      }],
+    };
+    const requestedUrls: URL[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      requestedUrls.push(url);
+      if (url.hostname === "api.the-odds-api.com") {
+        return new Response("{}", { status: 429 });
+      }
+      if (url.hostname === "site.api.espn.com") {
+        return url.pathname.endsWith("/scoreboard")
+          ? new Response(JSON.stringify({
+              events: url.pathname.includes("/eng.1/") ? [event] : [],
+            }), { status: 200 })
+          : new Response(JSON.stringify({ children: [] }), { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    });
+
+    const fixtures = await getUpcomingOddsFixtures();
+    expect(fixtures).toHaveLength(1);
+    expect(fixtures[0]).toMatchObject({
+      sport_key: "soccer_epl",
+      home_team: "Chelsea",
+      away_team: "Arsenal",
+      modelPriced: true,
+      bookmakers: [],
+    });
+    const queriedLeagues = new Set(requestedUrls
+      .filter((url) => url.hostname === "site.api.espn.com" && url.pathname.endsWith("/scoreboard"))
+      .map((url) => url.pathname.split("/").slice(-2, -1)[0]));
+    expect(queriedLeagues).toEqual(new Set([
+      "eng.1",
+      "esp.1",
+      "ita.1",
+      "ger.1",
+      "fra.1",
+      "uefa.champions",
+      "uefa.europa",
+      "eng.2",
+      "ned.1",
+      "por.1",
+    ]));
+
+    const picks = await analyseFixtures(fixtures, {
+      limit: 50,
+      singleBestPerMatch: true,
+    });
+    expect(picks).toHaveLength(1);
+    expect(picks[0].bookOdds).toBeGreaterThan(1);
+    expect(Number.isFinite(picks[0].bookOdds)).toBe(true);
+
+    vi.stubEnv("ODDS_API_KEY", "");
+    expect(await getUpcomingOddsFixtures()).toHaveLength(1);
+
+    const liveOddsFixture: OddsFixture = {
+      id: "live-api-fixture",
+      sport_key: "soccer_epl",
+      commence_time: kickoff,
+      home_team: "Chelsea",
+      away_team: "Arsenal",
+      bookmakers: [],
+    };
+    const liveApiUrls: string[] = [];
+    vi.stubEnv("ODDS_API_KEY", "working-key");
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = new URL(input.toString());
+      liveApiUrls.push(url.toString());
+      if (url.hostname === "api.the-odds-api.com") {
+        return new Response(JSON.stringify(
+          url.pathname.includes("/soccer_epl/") ? [liveOddsFixture] : [],
+        ), { status: 200 });
+      }
+      throw new Error(`Unexpected ESPN fallback request: ${url}`);
+    });
+    expect(await getUpcomingOddsFixtures()).toEqual([liveOddsFixture]);
+    expect(liveApiUrls.every((url) => url.includes("api.the-odds-api.com"))).toBe(true);
+  });
+
   it("recognizes best-play phrasing and requested match limits", async () => {
     expect(await classifyIntent("Give me 4 games today")).toBe("best_plays");
     expect(await classifyIntent("What are the safest picks?")).toBe("best_plays");
     expect(extractPickLimit("Show me 12 picks")).toBe(12);
+    expect(extractPickLimit("6 correct score games")).toBe(6);
+    expect(extractPickLimit("5 over/under games")).toBe(5);
+    expect(extractPickLimit("3 total shots games")).toBe(3);
+    expect(extractPickLimit("5 double chance games")).toBe(5);
+    expect(await classifyIntent("4 btts games")).toBe("best_plays");
+    expect(await classifyIntent("5 double chance games")).toBe("best_plays");
     expect(extractRequestedMatch("Please analyse Nottingham Forest vs Chelsea tonight")).toEqual({
       home: "Nottingham Forest",
       away: "Chelsea",

@@ -31,7 +31,13 @@ export function extractRequestedMatch(message: string): RequestedMatch | undefin
 }
 
 export function extractPickLimit(message: string): number | undefined {
-  const match = message.match(/\b(?:give(?:\s+me)?|show\s+me|top)\s+(\d{1,2})\s+(?:(?:best\s+)?(?:games?|picks?|options?))\b/i);
+  const explicitLimit = message.match(
+    /\b(?:give(?:\s+me)?|show\s+me|top)\s+(\d{1,2})\s+(?:(?:best\s+)?(?:games?|picks?|options?))\b/i,
+  );
+  const marketLimit = message.match(
+    /\b(\d{1,2})\s+(?:correct\s+score|over\s*\/\s*under|over|under|btts|both\s+teams\s+to\s+score|total\s+shots?|double\s+chance|draw\s+no\s+bet|dnb|asian\s+handicap|1x2)\s+games?\b/i,
+  );
+  const match = explicitLimit ?? marketLimit;
   if (!match) return undefined;
   const value = Number(match[1]);
   return Number.isInteger(value) && value > 0 ? Math.min(value, 50) : undefined;
@@ -73,6 +79,10 @@ export async function classifyIntent(message: string): Promise<ChatIntent> {
   const normalized = normalizeFootballQuestion(message);
   if (shouldOpenAnalysisBoard(normalized)) return "open_board";
   if (extractRequestedMatch(normalized)) return "analyse_match";
+  if (
+    /^\d{1,2}\s+.+\s+games?\b/i.test(normalized) &&
+    extractTargetMarket(normalized) !== "all"
+  ) return "best_plays";
   if (/^(?:for|show|give me)\s+(?:the\s+)?(?:over|under|goals?|correct score|total shots?|btts|1x2|double chance|draw no bet|asian handicap)\b/i.test(normalized)) {
     return "analyse_match";
   }

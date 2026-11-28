@@ -369,6 +369,11 @@ function makePick(
   };
 }
 
+function modelOdds(probability: number): number | undefined {
+  if (!Number.isFinite(probability) || probability <= 0 || probability > 1) return undefined;
+  return Math.max(1.05, Number((1 / (probability * 1.06)).toFixed(2)));
+}
+
 export async function analyseFixtures(
   fixturesWithOdds: FixtureWithOdds[],
   options: AnalyseFixturesOptions = {},
@@ -433,10 +438,19 @@ export async function analyseFixtures(
       lambdaAway: probabilities.lambdaAway,
       dataQuality,
     };
+    const modelPricedFallback = fixture.modelPriced === true && !fixture.confirmedBets?.length;
     const candidatePicks = [
-      ...modelOnlyCandidates(fixture, probabilities, homeStats, awayStats).map((candidate) =>
-        makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo),
-      ),
+      ...modelOnlyCandidates(fixture, probabilities, homeStats, awayStats).map((candidate) => {
+        const price = modelPricedFallback ? modelOdds(candidate.modelProb) : undefined;
+        return makePick(
+          fixture,
+          candidate.market,
+          candidate.selection,
+          candidate.modelProb,
+          statsInfo,
+          price === undefined ? undefined : { price, fairProb: 1 / price },
+        );
+      }),
       ...makeOddsCandidates(fixture, probabilities).map((candidate) =>
         makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo, {
           price: candidate.odds,
@@ -480,7 +494,15 @@ export async function analyseFixtures(
 
   const allPicks = [...picksByKey.values()];
   if (options.singleBestPerMatch) {
-    return selectSingleBestPick(allPicks.filter((pick) => pick.dataQuality !== "limited"), {
+    const modelPricedMatches = new Set(
+      fixturesWithOdds
+        .filter((fixture) => fixture.modelPriced)
+        .map((fixture) => `${fixture.home_team} vs ${fixture.away_team}`.toLowerCase()),
+    );
+    const eligiblePicks = allPicks.filter((pick) =>
+      pick.dataQuality !== "limited" || modelPricedMatches.has(pick.match.toLowerCase()),
+    );
+    return selectSingleBestPick(eligiblePicks, {
       targetMarket: options.targetMarket ?? "all",
       limit,
     });
