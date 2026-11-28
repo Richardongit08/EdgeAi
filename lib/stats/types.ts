@@ -27,8 +27,7 @@ export interface TeamStats {
   goalsAgainstAway: number;
   xgFor?: number;
   xgAgainst?: number;
-  shotsFor?: number;
-  shotsAgainst?: number;
+  isLeagueAverageBaseline?: boolean;
   injuries: string[];
   standingsPosition?: number;
 }

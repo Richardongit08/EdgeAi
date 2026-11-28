@@ -1,367 +1,253 @@
-import {
-  classifyIntent,
-  extractPickLimit,
-  extractRequestedMatch,
-  extractTargetMarket,
-  normalizeFootballQuestion,
-  type RequestedMatch,
-} from "@/lib/ai/intent";
+import { classifyIntent, extractPickLimit, extractRequestedMatch } from "@/lib/ai/intent";
 import { extractBetsFromImage } from "@/lib/ai/extract";
-import { answerPunterQuestion } from "@/lib/ai/punterChat";
 import { analyseFixtures, type FixtureWithOdds } from "@/lib/model/analyseFixtures";
+import { selectBestPick } from "@/lib/model/selectBestPick";
+import { extractedBetSchema, type ExtractedBet, type Pick } from "@/lib/stats/types";
 import {
   findOddsFixture,
-  getUpcomingOddsFixtures,
   getSportKeyForLeague,
+  getUpcomingOddsFixtures,
   type OddsFixture,
 } from "@/lib/stats/oddsApi";
-import type { ExtractedBet, Pick } from "@/lib/stats/types";
 
-const seenUpdateIds = new Set<number>();
-const lastFixtureByChat = new Map<string, RequestedMatch>();
-const TELEGRAM_MAX_MESSAGE_LENGTH = 4000;
-const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
-const RESPONSIBLE_FOOTER = "Estimates only. No outcome is guaranteed. Gamble responsibly. 18+.";
+const DISCLAIMER = "Estimates only. No outcome is guaranteed. Gamble responsibly. 18+";
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_PICKS_PER_FIXTURE = 50;
 
-interface TelegramPhoto {
-  file_id: string;
-  width: number;
-  height: number;
-  file_size?: number;
-}
-
-export interface TelegramIncomingMessage {
-  chat?: { id?: number | string };
+export interface TelegramMessage {
+  chat: { id: number | string };
   text?: string;
-  photo?: TelegramPhoto[];
+  photo?: Array<{ file_id: string }>;
 }
 
-interface TelegramFileResponse {
-  ok?: boolean;
+interface TelegramApiResponse<T> {
+  ok: boolean;
+  result?: T;
   description?: string;
-  result?: { file_path?: string; file_size?: number };
 }
 
-function getBotToken(): string {
+interface TelegramFile {
+  file_path?: string;
+}
+
+const WELCOME_MESSAGE =
+  "Welcome to EdgeAI. Send a football match query (for example, “Arsenal vs Chelsea”) or ask for the best plays. You can also upload a bet-slip screenshot for a leg-by-leg probability and value check.";
+
+async function telegramApi<T>(method: string, init?: RequestInit): Promise<T> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
-  return token;
-}
 
-export function recordTelegramUpdate(updateId: number): boolean {
-  if (!Number.isSafeInteger(updateId) || seenUpdateIds.has(updateId)) return false;
-  seenUpdateIds.add(updateId);
-  if (seenUpdateIds.size > 500) {
-    const oldest = seenUpdateIds.values().next().value as number | undefined;
-    if (oldest !== undefined) seenUpdateIds.delete(oldest);
+  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, init);
+  const payload = await response.json() as TelegramApiResponse<T>;
+  if (!response.ok || !payload.ok || payload.result === undefined) {
+    throw new Error(payload.description ?? `Telegram ${method} request failed.`);
   }
-  return true;
+  return payload.result;
 }
 
-export function splitTelegramMessage(text: string, limit = TELEGRAM_MAX_MESSAGE_LENGTH): string[] {
-  if (!text) return [];
-  const points = Array.from(text);
+export async function sendTelegramChatAction(chatId: number | string): Promise<void> {
+  await telegramApi("sendChatAction", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+  });
+}
+
+export function splitTelegramMessage(text: string, maxLength = 4096): string[] {
+  if (!Number.isInteger(maxLength) || maxLength < 1) {
+    throw new RangeError("maxLength must be a positive integer.");
+  }
+
   const chunks: string[] = [];
-  while (points.length > 0) {
-    let length = 0;
-    let end = 0;
-    while (end < points.length && length + points[end].length <= limit) {
-      length += points[end].length;
-      end += 1;
+  let remaining = text;
+  while (remaining.length > maxLength) {
+    let splitAt = remaining.lastIndexOf("\n", maxLength - 1);
+    if (splitAt >= 0) {
+      splitAt += 1;
+    } else {
+      splitAt = remaining.lastIndexOf(" ", maxLength - 1);
+      if (splitAt >= 0) splitAt += 1;
     }
-    if (end === 0) end = 1;
-    if (end < points.length) {
-      let whitespace = end - 1;
-      while (whitespace > 0 && !/\s/.test(points[whitespace])) whitespace -= 1;
-      if (whitespace > 0) end = whitespace + 1;
-    }
-    chunks.push(points.splice(0, end).join(""));
+    if (splitAt <= 0) splitAt = maxLength;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt);
   }
+  if (remaining.length > 0) chunks.push(remaining);
   return chunks;
 }
 
-async function telegramRequest(method: string, body: Record<string, unknown>): Promise<unknown> {
-  const token = getBotToken();
-  const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(10000),
-  });
-  if (!response.ok) throw new Error(`Telegram ${method} request failed (${response.status}).`);
-  const payload = await response.json() as { ok?: boolean; description?: string };
-  if (payload.ok !== true) throw new Error(`Telegram ${method} failed: ${payload.description ?? "unknown error"}`);
-  return payload;
-}
-
-export async function sendTelegramChatAction(chatId: number | string, action: "typing"): Promise<void> {
-  await telegramRequest("sendChatAction", { chat_id: chatId, action });
-}
-
-export async function sendTelegramMessage(chatId: number | string, text: string): Promise<void> {
+export async function sendTelegramMessage(
+  chatId: number | string,
+  text: string,
+): Promise<void> {
   for (const chunk of splitTelegramMessage(text)) {
-    await telegramRequest("sendMessage", { chat_id: chatId, text: chunk });
+    await telegramApi("sendMessage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: chunk }),
+    });
   }
 }
 
-function welcomeMessage(): string {
-  return [
-    "Welcome to EdgeAI — your football stats and punter co-pilot.",
-    "Ask for the safest available picks, analyse a match, or specify a market such as goals, BTTS, 1X2, or correct score.",
-    "Send a bet-slip screenshot for a leg-by-leg probability and edge check.",
-    RESPONSIBLE_FOOTER,
-  ].join("\n\n");
-}
-
-function mentionMatches(fixtures: OddsFixture[], text: string): OddsFixture[] {
-  const normalized = normalizeFootballQuestion(text).toLowerCase();
-  const words = normalized.split(/[^a-z0-9]+/);
-  const mentions = (name: string) => {
-    const tokens = normalizeFootballQuestion(name).toLowerCase().split(/[^a-z0-9]+/)
-      .filter((token) => token.length > 2 && !["the", "fc", "cf", "afc", "sc"].includes(token));
-    const first = tokens[0];
-    return tokens.length > 0 && (
-      tokens.every((token) => normalized.includes(token)) ||
-      (first.length >= 5 && words.includes(first))
-    );
-  };
-  return fixtures.flatMap((fixture) => {
-    const home = mentions(fixture.home_team);
-    const away = mentions(fixture.away_team);
-    return home || away ? [{ fixture, both: home && away }] : [];
-  }).sort((a, b) => Number(b.both) - Number(a.both) ||
-    Date.parse(a.fixture.commence_time) - Date.parse(b.fixture.commence_time))
-    .slice(0, 3)
-    .map(({ fixture }) => fixture);
-}
-
-function firstStatsSentence(pick: Pick): string {
-  return pick.justification.split(". ")[0].replace(/[.!?]+$/, "");
-}
-
-export function formatTelegramPicks(picks: Pick[]): string {
-  const lines = picks.map((pick, index) => [
-    `${index + 1}. ${pick.match}`,
-    `Pick: ${pick.selection} — ${(pick.modelProb * 100).toFixed(1)}% (highest model probability)`,
-    `Odds: ${pick.bookOdds === null ? "@ Model Fair (no live price)" : `@ ${pick.bookOdds.toFixed(2)}`}`,
-    `Stats: ${firstStatsSentence(pick)}; data quality ${pick.dataQuality}.`,
-  ].join("\n"));
-  return `${lines.join("\n\n")}\n\n${RESPONSIBLE_FOOTER}`;
-}
-
-function explainNoPicks(fixtureCount: number): string {
-  return fixtureCount === 0
-    ? `No upcoming fixtures with usable odds are available in the next 36 hours.\n\n${RESPONSIBLE_FOOTER}`
-    : `No grounded pick is available: fetched team statistics are insufficient for the requested market.\n\n${RESPONSIBLE_FOOTER}`;
-}
-
-async function replyToText(chatId: number | string, text: string): Promise<void> {
-  const command = text.trim().split(/\s+/, 1)[0].toLowerCase().replace(/@[^@]+$/, "");
-  if (command === "/start" || command === "/help") {
-    await sendTelegramMessage(chatId, welcomeMessage());
-    return;
+export async function sendTelegramMessages(
+  chatId: number | string,
+  messages: string[],
+): Promise<void> {
+  for (const message of messages) {
+    await sendTelegramMessage(chatId, message);
   }
+}
+
+export function selectHighestProbabilityPick(picks: Pick[]): Pick | undefined {
+  return selectBestPick(picks);
+}
+
+export function formatBestPickMessages(picks: Pick[]): string[] {
+  return picks.map((pick, index) => {
+    const message = [
+      `Match: ${pick.match}`,
+      `Probability: ${(pick.modelProb * 100).toFixed(1)}%`,
+      `Pick: ${pick.selection}`,
+      `odds: ${(pick.bookOdds !== null && Number.isFinite(pick.bookOdds) && pick.bookOdds > 1
+        ? pick.bookOdds
+        : 1 / Math.min(Math.max(pick.modelProb, 0.0001), 1)).toFixed(2)}`,
+    ].join("\n");
+    return index === picks.length - 1 ? `${message}\n\n${DISCLAIMER}` : message;
+  });
+}
+
+export function formatBestPicks(picks: Pick[]): string {
+  return formatBestPickMessages(picks).join("\n\n");
+}
+
+function plainReply(message: string): string[] {
+  return [message];
+}
+
+async function textReply(text: string): Promise<string[]> {
+  if (isHelpCommand(text)) return plainReply(WELCOME_MESSAGE);
 
   const intent = await classifyIntent(text);
-  const lastFixture = lastFixtureByChat.get(String(chatId));
-  const requestedMatch = extractRequestedMatch(text) ?? lastFixture;
-  const targetMarket = extractTargetMarket(text);
-  const limit = extractPickLimit(text) ?? 5;
-
-  if (intent === "open_board") {
-    await sendTelegramMessage(chatId, `The full Analysis Board is available in the EdgeAI web chat. Here, ask for a fixture or slate pick.\n\n${RESPONSIBLE_FOOTER}`);
-    return;
+  if (intent === "general" || intent === "explain_pick") {
+    return plainReply("Ask for the best plays or name a match (Team A vs Team B). You can also upload a bet-slip screenshot for analysis.");
   }
 
   const fixtures = await getUpcomingOddsFixtures();
-  let selectedFixtures: OddsFixture[] = [];
-  if (intent === "best_plays") {
-    selectedFixtures = fixtures;
-  } else if (intent === "analyse_match") {
-    if (!requestedMatch) {
-      await sendTelegramMessage(chatId, `Name the fixture as Team A vs Team B, or ask about a fixture from earlier in this chat.\n\n${RESPONSIBLE_FOOTER}`);
-      return;
-    }
+  if (intent === "analyse_match") {
+    const requestedMatch = extractRequestedMatch(text);
+    if (!requestedMatch) return plainReply("Name the match in the format Team A vs Team B.");
     const fixture = findOddsFixture(fixtures, requestedMatch.home, requestedMatch.away);
     if (!fixture) {
-      await sendTelegramMessage(chatId, `I couldn't match ${requestedMatch.home} vs ${requestedMatch.away} to an upcoming fixture in the 36-hour window.\n\n${RESPONSIBLE_FOOTER}`);
-      return;
+      return plainReply(`I couldn't match ${requestedMatch.home} vs ${requestedMatch.away} to an upcoming fixture with live odds.`);
     }
-    selectedFixtures = [fixture];
-    lastFixtureByChat.set(String(chatId), { home: fixture.home_team, away: fixture.away_team });
-  } else {
-    selectedFixtures = mentionMatches(fixtures, text);
+    const picks = await analyseFixtures([fixture], { limit: MAX_PICKS_PER_FIXTURE });
+    const bestPick = selectHighestProbabilityPick(picks);
+    return bestPick
+      ? formatBestPickMessages([bestPick])
+      : plainReply("No statistical picks are available for that match right now.");
   }
 
-  const picks = selectedFixtures.length > 0
-    ? await analyseFixtures(selectedFixtures, {
-        limit: intent === "best_plays" ? limit : Math.max(1, selectedFixtures.length),
-        singleBestPerMatch: true,
-        targetMarket,
-      })
-    : [];
-  if (intent !== "best_plays" && intent !== "analyse_match") {
-    if (picks.length > 0) {
-      const fixture = selectedFixtures[0];
-      lastFixtureByChat.set(String(chatId), { home: fixture.home_team, away: fixture.away_team });
-      await sendTelegramMessage(chatId, formatTelegramPicks(picks));
-    } else {
-      await sendTelegramMessage(chatId, `${await answerPunterQuestion(text, [])}\n\n${RESPONSIBLE_FOOTER}`);
-    }
-    return;
+  const fixtureLimit = extractPickLimit(text) ?? 6;
+  const upcomingFixtures = fixtures.slice(0, fixtureLimit);
+  if (upcomingFixtures.length === 0) {
+    return plainReply("No upcoming fixtures with odds are available to analyse. Check ODDS_API_KEY and try again.");
   }
-  await sendTelegramMessage(chatId, picks.length > 0
-    ? formatTelegramPicks(picks)
-    : explainNoPicks(selectedFixtures.length));
+
+  const picksByFixture = await Promise.all(upcomingFixtures.map((fixture) =>
+    analyseFixtures([fixture], { limit: MAX_PICKS_PER_FIXTURE }),
+  ));
+  const bestPicks = picksByFixture
+    .map(selectHighestProbabilityPick)
+    .filter((pick): pick is Pick => pick !== undefined);
+  return bestPicks.length
+    ? formatBestPickMessages(bestPicks)
+    : plainReply("No statistical picks are available for the upcoming fixtures right now.");
 }
 
-function getImageMimeType(filePath: string, contentType: string | null): string {
-  const accepted = ["image/jpeg", "image/png", "image/webp"];
-  const headerType = contentType?.split(";")[0].trim().toLowerCase();
-  if (headerType && accepted.includes(headerType)) return headerType;
-  const extension = filePath.split(".").pop()?.toLowerCase();
-  if (extension === "png") return "image/png";
-  if (extension === "webp") return "image/webp";
-  if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
-  throw new Error("Telegram returned an unsupported image format.");
+function isHelpCommand(text: string): boolean {
+  return /^\/(?:start|help)(?:@\w+)?(?:\s|$)/i.test(text.trim());
 }
 
-async function fetchTelegramPhoto(photo: TelegramPhoto): Promise<{ base64: string; mimeType: string }> {
-  const token = getBotToken();
-  const fileResponse = await fetch(
-    `https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(photo.file_id)}`,
-    { cache: "no-store", signal: AbortSignal.timeout(10000) },
+function fixtureForBet(bet: ExtractedBet, fixtures: OddsFixture[], index: number): FixtureWithOdds {
+  const fixture = findOddsFixture(fixtures, bet.home, bet.away);
+  return fixture
+    ? { ...fixture, confirmedBets: [bet] }
+    : {
+        id: `telegram-screenshot-${index}`,
+        sport_key: getSportKeyForLeague(bet.league),
+        commence_time: bet.date ?? new Date().toISOString(),
+        home_team: bet.home,
+        away_team: bet.away,
+        bookmakers: [],
+        confirmedBets: [bet],
+      };
+}
+
+async function photoReply(message: TelegramMessage): Promise<string> {
+  const photo = message.photo?.at(-1);
+  if (!photo) return "I couldn't read a photo from that message.";
+
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+  const file = await telegramApi<TelegramFile>(
+    `getFile?file_id=${encodeURIComponent(photo.file_id)}`,
   );
-  if (!fileResponse.ok) throw new Error(`Telegram getFile failed (${fileResponse.status}).`);
-  const filePayload = await fileResponse.json() as TelegramFileResponse;
-  const filePath = filePayload.result?.file_path;
-  if (filePayload.ok !== true || !filePath) {
-    throw new Error(`Telegram getFile failed: ${filePayload.description ?? "file path is unavailable"}`);
+  if (!file.file_path) throw new Error("Telegram did not return a photo file path.");
+
+  const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error("Could not download the Telegram photo.");
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_BYTES) {
+    throw new Error("Bet-slip images must be smaller than 10 MB.");
   }
-  const segments = filePath.split("/");
-  if (segments.some((segment) => !segment || segment === "." || segment === ".." || /[?#\\]/.test(segment))) {
-    throw new Error("Telegram returned an invalid image path.");
-  }
-  if ((filePayload.result?.file_size ?? photo.file_size ?? 0) > MAX_PHOTO_BYTES) {
-    throw new Error("The screenshot must be smaller than 10 MB.");
+  const image = await response.arrayBuffer();
+  if (image.byteLength > MAX_IMAGE_BYTES) {
+    throw new Error("Bet-slip images must be smaller than 10 MB.");
   }
 
-  const url = `https://api.telegram.org/file/bot${token}/${segments.map(encodeURIComponent).join("/")}`;
-  const imageResponse = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(15000) });
-  if (!imageResponse.ok) throw new Error(`Telegram image download failed (${imageResponse.status}).`);
-  const contentLength = Number(imageResponse.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > MAX_PHOTO_BYTES) {
-    throw new Error("The screenshot must be smaller than 10 MB.");
-  }
-  const bytes = await imageResponse.arrayBuffer();
-  if (bytes.byteLength === 0 || bytes.byteLength > MAX_PHOTO_BYTES) {
-    throw new Error("The screenshot must be a non-empty image smaller than 10 MB.");
-  }
-  const mimeType = getImageMimeType(filePath, imageResponse.headers.get("content-type"));
-  return { base64: Buffer.from(bytes).toString("base64"), mimeType };
-}
-
-function sameFixture(pick: Pick, fixture: OddsFixture): boolean {
-  return pick.match.toLowerCase() === `${fixture.home_team} vs ${fixture.away_team}`.toLowerCase();
-}
-
-function marketFamily(market: string): string {
-  const value = market.toLowerCase();
-  if (/correct\s*score/.test(value)) return "correct_score";
-  if (/shot/.test(value)) return "total_shots";
-  if (/btts|both\s+teams/.test(value)) return "btts";
-  if (/double\s+chance/.test(value)) return "double_chance";
-  if (/draw\s+no\s+bet|\bdnb\b/.test(value)) return "draw_no_bet";
-  if (/handicap|spread/.test(value)) return "asian_handicap";
-  if (/1x2|\bh2h\b|match\s+(?:result|winner)/.test(value)) return "1x2";
-  if (/goal|over|under|total/.test(value)) return "goals";
-  return value;
-}
-
-function normalizeSelection(selection: string): string {
-  return selection.toLowerCase()
-    .replace(/\b(?:goals?|shots?)\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function findLegPick(picks: Pick[], bet: ExtractedBet, fixture: OddsFixture): Pick | undefined {
-  return picks.find((pick) =>
-    sameFixture(pick, fixture) &&
-    pick.dataQuality !== "limited" &&
-    marketFamily(pick.market) === marketFamily(bet.market) &&
-    normalizeSelection(pick.selection) === normalizeSelection(bet.selection),
+  const contentType = response.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
+  const mimeType = contentType.startsWith("image/") ? contentType : "image/jpeg";
+  const bets = extractedBetSchema.array().parse(
+    await extractBetsFromImage(Buffer.from(image).toString("base64"), mimeType),
   );
-}
-
-async function replyToPhoto(chatId: number | string, photos: TelegramPhoto[]): Promise<void> {
-  if (photos.length === 0) {
-    await sendTelegramMessage(chatId, `No screenshot was attached.\n\n${RESPONSIBLE_FOOTER}`);
-    return;
-  }
-  const photo = [...photos].sort((a, b) => b.width * b.height - a.width * a.height)[0];
-  if (photo.file_size !== undefined && photo.file_size > MAX_PHOTO_BYTES) {
-    await sendTelegramMessage(chatId, `The screenshot must be smaller than 10 MB.\n\n${RESPONSIBLE_FOOTER}`);
-    return;
-  }
-
-  const { base64, mimeType } = await fetchTelegramPhoto(photo);
-  const bets = await extractBetsFromImage(base64, mimeType);
   if (bets.length === 0) {
-    await sendTelegramMessage(chatId, `No football bets could be extracted from that screenshot.\n\n${RESPONSIBLE_FOOTER}`);
-    return;
+    return "I couldn't identify any confirmed bet legs in that screenshot.";
   }
 
   const availableFixtures = await getUpcomingOddsFixtures();
-  const fixturesWithBets: Array<{ bet: ExtractedBet; fixture: FixtureWithOdds }> = bets.map((bet, index) => {
-    const availableFixture = findOddsFixture(availableFixtures, bet.home, bet.away);
-    const fixture: FixtureWithOdds = availableFixture ?? {
-      id: `telegram-slip-${index}`,
-      sport_key: getSportKeyForLeague(bet.league),
-      commence_time: bet.date ?? new Date().toISOString(),
-      home_team: bet.home,
-      away_team: bet.away,
-      bookmakers: [],
-    };
-    return { bet, fixture: { ...fixture, confirmedBets: [bet] } };
-  });
-  const picks = await analyseFixtures(fixturesWithBets.map(({ fixture }) => fixture), { limit: 50 });
-  const lines = fixturesWithBets.map(({ bet, fixture }, index) => {
-    const pick = findLegPick(picks, bet, fixture);
+  const fixtureBets = bets.map((bet, index) => fixtureForBet(bet, availableFixtures, index));
+  const analyses = await Promise.all(fixtureBets.map((fixture) =>
+    analyseFixtures([fixture], { limit: MAX_PICKS_PER_FIXTURE }),
+  ));
+  const legs = bets.map((bet, index) => {
+    const fixture = fixtureBets[index];
+    const matchName = `${fixture.home_team} vs ${fixture.away_team}`;
+    const pick = analyses[index].find((candidate) =>
+      candidate.match === matchName &&
+      candidate.market.toLowerCase() === bet.market.toLowerCase() &&
+      candidate.selection.toLowerCase() === bet.selection.toLowerCase(),
+    );
     if (!pick) {
-      return [
-        `${index + 1}. ${fixture.home_team} vs ${fixture.away_team}`,
-        `Leg: ${bet.selection} — probability unavailable`,
-        `Odds: ${bet.odds ? `@ ${bet.odds.toFixed(2)}` : "not shown"}`,
-        "Edge: unavailable because the market or supporting team statistics could not be verified.",
-      ].join("\n");
+      return `${index + 1}. ${matchName} — ${bet.market}: ${bet.selection}\nProbability: unavailable; the model couldn't map this leg to a supported market.\nValue check: unavailable.`;
     }
-    const edge = pick.edge === null
-      ? "unavailable (no bookmaker price)"
-      : `${pick.edge >= 0 ? "+" : ""}${(pick.edge * 100).toFixed(1)}% vs implied probability`;
-    return [
-      `${index + 1}. ${pick.match}`,
-      `Leg: ${bet.selection} — ${(pick.modelProb * 100).toFixed(1)}%`,
-      `Odds: ${pick.bookOdds === null ? "@ Model Fair" : `@ ${pick.bookOdds.toFixed(2)}`}`,
-      `Edge: ${edge}`,
-      `Stats: ${firstStatsSentence(pick)}; data quality ${pick.dataQuality}.`,
-    ].join("\n");
+    const valueCheck = pick.bookOdds === null || pick.ev === null
+      ? "Odds unavailable; value cannot be calculated."
+      : `${pick.ev > 0 ? "Potential value" : "No model value"} (model expected value ${((pick.ev ?? 0) * 100).toFixed(1)}%; decimal odds ${pick.bookOdds.toFixed(2)}).`;
+    return `${index + 1}. ${matchName} — ${bet.market}: ${bet.selection}\nProbability: ${(pick.modelProb * 100).toFixed(1)}% hit chance.\nValue check: ${valueCheck}`;
   });
-  const response = `Bet-slip leg check\n\n${lines.join("\n\n")}\n\n${RESPONSIBLE_FOOTER}`;
-  await sendTelegramMessage(chatId, response);
+  return `${legs.join("\n\n")}\n\n${DISCLAIMER}`;
 }
 
-export async function handleTelegramMessage(message: TelegramIncomingMessage): Promise<void> {
-  const chatId = message.chat?.id;
-  if (chatId === undefined || chatId === null) return;
-  const hasText = typeof message.text === "string" && message.text.trim().length > 0;
-  const hasPhoto = Array.isArray(message.photo) && message.photo.length > 0;
-  if (!hasText && !hasPhoto) return;
-
-  await sendTelegramChatAction(chatId, "typing");
-  if (hasPhoto) {
-    await replyToPhoto(chatId, message.photo ?? []);
-  } else if (hasText) {
-    await replyToText(chatId, message.text!.trim());
+export async function createTelegramReplyMessages(message: TelegramMessage): Promise<string[]> {
+  if (message.photo?.length) return [await photoReply(message)];
+  if (typeof message.text === "string" && message.text.trim()) {
+    return textReply(message.text.trim());
   }
+  return plainReply("Send a football match question or upload a bet-slip screenshot.");
+}
+
+export async function createTelegramReply(message: TelegramMessage): Promise<string> {
+  return (await createTelegramReplyMessages(message)).join("\n\n");
 }

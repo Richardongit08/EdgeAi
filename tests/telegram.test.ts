@@ -1,93 +1,120 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { recordTelegramUpdate, splitTelegramMessage } from "../lib/channels/telegram";
 import { NextRequest } from "next/server";
-import { POST } from "../src/app/api/telegram/route";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  formatBestPickMessages,
+  formatBestPicks,
+  selectHighestProbabilityPick,
+  sendTelegramMessages,
+  splitTelegramMessage,
+} from "../lib/channels/telegram";
+import { selectBestPick } from "../lib/model/selectBestPick";
+import { GET, POST } from "../src/app/api/telegram/route";
+import type { Pick } from "../lib/stats/types";
 
-describe("Telegram webhook helpers", () => {
-  it("deduplicates update ids", () => {
-    const updateId = 987654321;
-    expect(recordTelegramUpdate(updateId)).toBe(true);
-    expect(recordTelegramUpdate(updateId)).toBe(false);
-  });
-
-  it("evicts old update ids when the deduplication set exceeds 500 entries", () => {
-    const firstId = 700000000;
-    for (let offset = 0; offset <= 500; offset += 1) {
-      expect(recordTelegramUpdate(firstId + offset)).toBe(true);
-    }
-    expect(recordTelegramUpdate(firstId)).toBe(true);
-    expect(recordTelegramUpdate(firstId + 500)).toBe(false);
-  });
-
-  it("splits long messages into safe chunks without losing content", () => {
-    const text = `${"This is a long Telegram message. ".repeat(300)}⚽`;
-    const chunks = splitTelegramMessage(text);
-    expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks.every((chunk) => chunk.length <= 4096)).toBe(true);
-    expect(chunks.join("")).toBe(text);
-  });
+const pick = (selection: string, modelProb: number): Pick => ({
+  match: "Arsenal vs Chelsea",
+  market: "1X2",
+  selection,
+  modelProb,
+  bookOdds: 2.15,
+  fairProb: 0.46,
+  edge: modelProb - 0.46,
+  ev: modelProb * 2.15 - 1,
+  confidence: "medium",
+  justification: "The model uses available team statistics.",
+  dataQuality: "partial",
 });
 
-describe("Telegram webhook route", () => {
+describe("Telegram reply helpers", () => {
+  it("selects the highest-probability pick rather than the best-value pick", () => {
+    const highProbability = pick("Double Chance", 0.72);
+    const highValue = { ...pick("Away win", 0.3), ev: 0.8 };
+
+    expect(selectHighestProbabilityPick([highValue, highProbability])).toBe(highProbability);
+  });
+
+  it("formats picks as separate four-line messages with numeric odds", () => {
+    const secondPick = {
+      ...pick("Under 2.5", 0.62),
+      match: "Liverpool vs Brighton",
+      bookOdds: null,
+    };
+    const messages = formatBestPickMessages([pick("Arsenal", 0.615), secondPick]);
+    const reply = formatBestPicks([pick("Arsenal", 0.615)]);
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0].split("\n")).toEqual([
+      "Match: Arsenal vs Chelsea",
+      "Probability: 61.5%",
+      "Pick: Arsenal",
+      "odds: 2.15",
+    ]);
+    expect(messages[1].split("\n").slice(0, 4)).toEqual([
+      "Match: Liverpool vs Brighton",
+      "Probability: 62.0%",
+      "Pick: Under 2.5",
+      "odds: 1.61",
+    ]);
+    expect(messages[0]).not.toContain("Statistical justification:");
+    expect(messages[1]).not.toContain("Statistical justification:");
+    expect(messages[0]).not.toContain("18+");
+    expect(messages[1].endsWith("Estimates only. No outcome is guaranteed. Gamble responsibly. 18+")).toBe(true);
+    expect(reply).not.toContain("Unavailable");
+    expect(reply).not.toContain("Statistical justification:");
+    expect(reply.endsWith("Estimates only. No outcome is guaranteed. Gamble responsibly. 18+")).toBe(true);
+  });
+
+  it("prefers priced picks only within the high-probability candidates", () => {
+    const unpricedHighProbability = { ...pick("Home", 0.78), bookOdds: null };
+    const pricedHighProbability = { ...pick("Double Chance", 0.65), bookOdds: 1.45 };
+    const pricedLowProbability = { ...pick("Away", 0.42), bookOdds: 2.8 };
+
+    expect(selectBestPick([
+      unpricedHighProbability,
+      pricedHighProbability,
+      pricedLowProbability,
+    ])).toBe(pricedHighProbability);
+  });
+
+  it("sends a batch as sequential, separate Telegram messages", async () => {
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    const sentMessages: string[] = [];
+    vi.stubGlobal("fetch", async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { text: string };
+      sentMessages.push(body.text);
+      return new Response(JSON.stringify({ ok: true, result: { message_id: sentMessages.length } }), {
+        status: 200,
+      });
+    });
+
+    await sendTelegramMessages(123, ["first pick", "second pick"]);
+
+    expect(sentMessages).toEqual(["first pick", "second pick"]);
+  });
+
+  it("splits long plain-text messages without exceeding Telegram's limit", () => {
+    const message = `${"Match: Arsenal vs Chelsea\n".repeat(300)}Estimates only. No outcome is guaranteed.`;
+    const chunks = splitTelegramMessage(message, 256);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((chunk) => chunk.length <= 256)).toBe(true);
+    expect(chunks.join("")).toBe(message);
+  });
+
+  it("reports the Telegram health check and rejects an unconfigured webhook secret", async () => {
+    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "");
+    const health = await GET();
+    const unauthorized = await POST(new NextRequest("https://edgeai.example/api/telegram", {
+      method: "POST",
+      headers: { "x-telegram-bot-api-secret-token": "" },
+      body: JSON.stringify({ update_id: 1 }),
+    }));
+
+    expect(await health.json()).toEqual({ ok: true, service: "edgeai-telegram" });
+    expect(unauthorized.status).toBe(401);
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
-    vi.unstubAllGlobals();
-  });
-
-  it("rejects requests with a mismatched webhook secret", async () => {
-    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "expected-secret");
-    const request = new NextRequest("http://localhost/api/telegram", {
-      method: "POST",
-      headers: { "x-telegram-bot-api-secret-token": "wrong-secret" },
-      body: JSON.stringify({ update_id: 700000600 }),
-    });
-    const response = await POST(request);
-    expect(response.status).toBe(401);
-  });
-
-  it("sends typing before the welcome reply for an authenticated text message", async () => {
-    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "expected-secret");
-    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
-    const methods: string[] = [];
-    vi.stubGlobal("fetch", async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as { action?: string; text?: string };
-      methods.push(body.action ?? body.text ?? "");
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
-    });
-    const request = new NextRequest("http://localhost/api/telegram", {
-      method: "POST",
-      headers: { "x-telegram-bot-api-secret-token": "expected-secret" },
-      body: JSON.stringify({
-        update_id: 700000601,
-        message: { chat: { id: 123 }, text: "/start" },
-      }),
-    });
-    const response = await POST(request);
-    expect(response.status).toBe(200);
-    expect(methods[0]).toBe("typing");
-    expect(methods[1]).toContain("Welcome to EdgeAI");
-  });
-
-  it("keeps the configured bot private to other chat ids", async () => {
-    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "expected-secret");
-    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
-    vi.stubEnv("TELEGRAM_ALLOWED_CHAT_ID", "123");
-    const texts: string[] = [];
-    vi.stubGlobal("fetch", async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as { text?: string };
-      if (body.text) texts.push(body.text);
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
-    });
-    const request = new NextRequest("http://localhost/api/telegram", {
-      method: "POST",
-      headers: { "x-telegram-bot-api-secret-token": "expected-secret" },
-      body: JSON.stringify({
-        update_id: 700000602,
-        message: { chat: { id: 999 }, text: "/start" },
-      }),
-    });
-    const response = await POST(request);
-    expect(response.status).toBe(200);
-    expect(texts).toEqual(["Private EdgeAI bot."]);
   });
 });

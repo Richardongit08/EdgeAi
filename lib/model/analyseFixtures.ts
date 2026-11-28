@@ -16,6 +16,7 @@ import {
 } from "@/lib/stats/espnStats";
 import { teamNameSimilarity } from "@/lib/stats/fuzzy";
 import {
+  getMarketOdds,
   getSportKeyForLeague,
   type OddsFixture,
 } from "@/lib/stats/oddsApi";
@@ -321,6 +322,22 @@ function modelOnlyCandidates(
   return candidates;
 }
 
+function makeDoubleChanceCandidates(
+  fixture: OddsFixture,
+  probabilities: MarketProbabilities,
+): PricedOutcome[] {
+  return [
+    { selection: "1X", modelProb: probabilities.doubleChance.homeOrDraw },
+    { selection: "12", modelProb: probabilities.doubleChance.homeOrAway },
+    { selection: "X2", modelProb: probabilities.doubleChance.drawOrAway },
+  ].flatMap(({ selection, modelProb }) => {
+    const odds = getMarketOdds(fixture, selection, "Double Chance");
+    return odds === null
+      ? []
+      : [{ market: "Double Chance", selection, modelProb, odds, fairProb: 1 / odds }];
+  });
+}
+
 function makePick(
   fixture: OddsFixture,
   market: string,
@@ -426,6 +443,12 @@ export async function analyseFixtures(
           fairProb: candidate.fairProb,
         }),
       ),
+      ...makeDoubleChanceCandidates(fixture, probabilities).map((candidate) =>
+        makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo, {
+          price: candidate.odds,
+          fairProb: candidate.fairProb,
+        }),
+      ),
       ...(fixture.confirmedBets ?? []).flatMap((bet) => {
         const modelProb = modelProbability(
           bet.market,
@@ -434,11 +457,15 @@ export async function analyseFixtures(
           fixture.away_team,
           probabilities,
         );
-        if (modelProb === undefined || !bet.odds || bet.odds <= 1) return [];
-        return [makePick(fixture, bet.market, bet.selection, modelProb, statsInfo, {
-          price: bet.odds,
-          fairProb: 1 / bet.odds,
-        })];
+        if (modelProb === undefined) return [];
+        return [makePick(
+          fixture,
+          bet.market,
+          bet.selection,
+          modelProb,
+          statsInfo,
+          bet.odds && bet.odds > 1 ? { price: bet.odds, fairProb: 1 / bet.odds } : undefined,
+        )];
       }),
     ];
 

@@ -33,13 +33,16 @@ function strength(stats: TeamStats, side: "home" | "away", leagueAvgGoals: numbe
 export function deriveMarketProbabilities(context: MatchContext): MarketProbabilities {
   const homeStrength = strength(context.home, "home", context.leagueAvgGoals);
   const awayStrength = strength(context.away, "away", context.leagueAvgGoals);
-  const { lambdaHome, lambdaAway } = estimateExpectedGoals(
-    homeStrength.attack,
-    homeStrength.defence,
-    awayStrength.attack,
-    awayStrength.defence,
-    context.leagueAvgGoals,
-  );
+  const { lambdaHome, lambdaAway } =
+    context.home.isLeagueAverageBaseline || context.away.isLeagueAverageBaseline
+      ? { lambdaHome: 1.38, lambdaAway: 1.14 }
+      : estimateExpectedGoals(
+          homeStrength.attack,
+          homeStrength.defence,
+          awayStrength.attack,
+          awayStrength.defence,
+          context.leagueAvgGoals,
+        );
   const matrix = buildScoreMatrix(lambdaHome, lambdaAway);
 
   let home = 0;
