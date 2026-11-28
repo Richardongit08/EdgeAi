@@ -23,7 +23,7 @@ export function selectBestPick(picks: Pick[], targetMarket = "all"): Pick | unde
   return [...picks].sort(compareProbability)[0];
 }
 
-function matchesTargetMarket(pick: Pick, targetMarket: Exclude<TargetMarket, "all">): boolean {
+export function matchesTargetMarket(pick: Pick, targetMarket: Exclude<TargetMarket, "all">): boolean {
   const market = pick.market.trim().toLowerCase();
   switch (targetMarket) {
     case "goals":

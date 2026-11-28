@@ -1,12 +1,14 @@
 import { deriveMarketProbabilities, type MarketProbabilities } from "@/lib/model/markets";
 import { poissonProbability } from "@/lib/model/poisson";
 import { removeMargin } from "@/lib/model/value";
-import { selectSingleBestPick } from "@/lib/model/selectBestPick";
-import type { TargetMarket } from "@/lib/ai/intent";
+import { matchesTargetMarket, selectSingleBestPick } from "@/lib/model/selectBestPick";
 import {
-  getTeamStatistics,
-  searchTeams,
-} from "@/lib/stats/apiFootball";
+  buildAccumulator,
+  type AccumulatorOptions,
+  type AccumulatorResult,
+} from "@/lib/model/buildAccumulator";
+import type { TargetMarket } from "@/lib/ai/intent";
+import { getTeamStatistics, searchTeams } from "@/lib/stats/apiFootball";
 import {
   ESPN_LEAGUE_CODES,
   getEspnLeagueData,
@@ -273,6 +275,7 @@ function modelOnlyCandidates(
   probabilities: MarketProbabilities,
   homeStats: TeamStats,
   awayStats: TeamStats,
+  includeTotalShots: boolean,
 ): Array<{ market: string; selection: string; modelProb: number }> {
   const home = fixture.home_team;
   const away = fixture.away_team;
@@ -303,7 +306,7 @@ function modelOnlyCandidates(
       { market: `Goals Over/Under ${line}`, selection: `Under ${line}`, modelProb: probabilities.under[line] },
     );
   }
-  if (
+  if (includeTotalShots &&
     Number.isFinite(homeStats.shotsFor) && homeStats.shotsFor! > 0 &&
     Number.isFinite(awayStats.shotsFor) && awayStats.shotsFor! > 0
   ) {
@@ -371,15 +374,81 @@ function makePick(
 
 function modelOdds(probability: number): number | undefined {
   if (!Number.isFinite(probability) || probability <= 0 || probability > 1) return undefined;
-  return Math.max(1.05, Number((1 / (probability * 1.06)).toFixed(2)));
+  return Math.max(1.12, Number((1 / (probability * 1.06)).toFixed(2)));
 }
 
-export async function analyseFixtures(
+function priorForPick(
+  market: string,
+  selection: string,
+  fixture: OddsFixture,
+  leaguePrior: MarketProbabilities,
+): number {
+  const normalizedMarket = market.toLowerCase();
+  const normalizedSelection = selection.toLowerCase();
+  if (normalizedMarket === "1x2" || normalizedMarket === "h2h") {
+    if (/draw|tie/.test(normalizedSelection)) return leaguePrior.draw;
+    if (teamNameSimilarity(selection, fixture.home_team) >= 0.55) return leaguePrior.home;
+    if (teamNameSimilarity(selection, fixture.away_team) >= 0.55) return leaguePrior.away;
+  }
+  if (normalizedMarket.includes("double chance")) {
+    if (/1x/.test(normalizedSelection)) return leaguePrior.doubleChance.homeOrDraw;
+    if (/12/.test(normalizedSelection)) return leaguePrior.doubleChance.homeOrAway;
+    if (/x2/.test(normalizedSelection)) return leaguePrior.doubleChance.drawOrAway;
+  }
+  if (normalizedMarket.includes("btts")) {
+    return /no|false/.test(normalizedSelection) ? leaguePrior.bttsNo : leaguePrior.bttsYes;
+  }
+  if (normalizedMarket.includes("goals over/under") || normalizedMarket === "totals") {
+    const line = Number((selection.match(/\d+(?:\.\d+)?/) ?? market.match(/\d+(?:\.\d+)?/) ?? [])[0]);
+    if (Number.isFinite(line)) {
+      return /under/.test(normalizedSelection)
+        ? leaguePrior.under[line] ?? 0.5
+        : leaguePrior.over[line] ?? 0.5;
+    }
+  }
+  if (normalizedMarket.includes("draw no bet")) {
+    const totalWinProbability = leaguePrior.home + leaguePrior.away;
+    if (teamNameSimilarity(selection, fixture.home_team) >= 0.55) {
+      return leaguePrior.home / totalWinProbability;
+    }
+    if (teamNameSimilarity(selection, fixture.away_team) >= 0.55) {
+      return leaguePrior.away / totalWinProbability;
+    }
+  }
+  if (normalizedMarket.includes("handicap") || normalizedMarket.includes("spread")) {
+    return modelProbability(
+      market,
+      selection,
+      fixture.home_team,
+      fixture.away_team,
+      leaguePrior,
+    ) ?? 0.5;
+  }
+  if (normalizedMarket.includes("correct score")) {
+    return leaguePrior.topCorrectScores.find((score) => score.score === selection)?.probability ?? 0.08;
+  }
+  return 0.5;
+}
+
+function calibrateModelProbability(
+  market: string,
+  selection: string,
+  probability: number,
+  fixture: OddsFixture,
+  leaguePrior: MarketProbabilities,
+): number {
+  const isTotal = /goals over\/under|^totals$|^total shots$/i.test(market);
+  const maximum = isTotal ? 0.9 : 0.86;
+  const prior = priorForPick(market, selection, fixture, leaguePrior);
+  const shrunk = probability * 0.78 + prior * 0.22;
+  return Math.min(maximum, Math.max(0.01, shrunk));
+}
+
+export async function analyseFixtureCandidates(
   fixturesWithOdds: FixtureWithOdds[],
-  options: AnalyseFixturesOptions = {},
+  options: { targetMarket?: TargetMarket } = {},
 ): Promise<Pick[]> {
   if (fixturesWithOdds.length === 0) return [];
-  const limit = Math.max(1, Math.min(50, Math.floor(options.limit ?? 6)));
   const leagueCodes = [...new Set(fixturesWithOdds.map((fixture) =>
     ESPN_LEAGUE_CODES[fixture.sport_key] ?? ESPN_LEAGUE_CODES[getSportKeyForLeague(fixture.sport_key)] ?? "eng.1",
   ))];
@@ -425,6 +494,15 @@ export async function analyseFixtures(
       awayName: fixture.away_team,
     };
     const probabilities = deriveMarketProbabilities(context);
+    const leaguePriorStats = leagueAverageTeamStats(leagueAvgGoals);
+    const leaguePrior = deriveMarketProbabilities({
+      home: leaguePriorStats,
+      away: leaguePriorStats,
+      h2h: [],
+      leagueAvgGoals,
+      homeName: fixture.home_team,
+      awayName: fixture.away_team,
+    });
     const dataQuality: Pick["dataQuality"] = homeSource === "baseline" || awaySource === "baseline"
       ? "limited"
       : homeSource === "espn" && awaySource === "espn" &&
@@ -440,28 +518,61 @@ export async function analyseFixtures(
     };
     const modelPricedFallback = fixture.modelPriced === true && !fixture.confirmedBets?.length;
     const candidatePicks = [
-      ...modelOnlyCandidates(fixture, probabilities, homeStats, awayStats).map((candidate) => {
-        const price = modelPricedFallback ? modelOdds(candidate.modelProb) : undefined;
+      ...modelOnlyCandidates(
+        fixture,
+        probabilities,
+        homeStats,
+        awayStats,
+        options.targetMarket === "total_shots",
+      ).map((candidate) => {
+        const modelProb = calibrateModelProbability(
+          candidate.market,
+          candidate.selection,
+          candidate.modelProb,
+          fixture,
+          leaguePrior,
+        );
+        const price = modelPricedFallback ? modelOdds(modelProb) : undefined;
         return makePick(
           fixture,
           candidate.market,
           candidate.selection,
-          candidate.modelProb,
+          modelProb,
           statsInfo,
           price === undefined ? undefined : { price, fairProb: 1 / price },
         );
       }),
       ...makeOddsCandidates(fixture, probabilities).map((candidate) =>
-        makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo, {
-          price: candidate.odds,
-          fairProb: candidate.fairProb,
-        }),
+        makePick(
+          fixture,
+          candidate.market,
+          candidate.selection,
+          calibrateModelProbability(
+            candidate.market,
+            candidate.selection,
+            candidate.modelProb,
+            fixture,
+            leaguePrior,
+          ),
+          statsInfo,
+          { price: candidate.odds, fairProb: candidate.fairProb },
+        ),
       ),
       ...makeDoubleChanceCandidates(fixture, probabilities).map((candidate) =>
-        makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo, {
-          price: candidate.odds,
-          fairProb: candidate.fairProb,
-        }),
+        makePick(
+          fixture,
+          candidate.market,
+          candidate.selection,
+          calibrateModelProbability(
+            candidate.market,
+            candidate.selection,
+            candidate.modelProb,
+            fixture,
+            leaguePrior,
+          ),
+          statsInfo,
+          { price: candidate.odds, fairProb: candidate.fairProb },
+        ),
       ),
       ...(fixture.confirmedBets ?? []).flatMap((bet) => {
         const modelProb = modelProbability(
@@ -472,11 +583,18 @@ export async function analyseFixtures(
           probabilities,
         );
         if (modelProb === undefined) return [];
+        const calibratedProb = calibrateModelProbability(
+          bet.market,
+          bet.selection,
+          modelProb,
+          fixture,
+          leaguePrior,
+        );
         return [makePick(
           fixture,
           bet.market,
           bet.selection,
-          modelProb,
+          calibratedProb,
           statsInfo,
           bet.odds && bet.odds > 1 ? { price: bet.odds, fairProb: 1 / bet.odds } : undefined,
         )];
@@ -492,7 +610,25 @@ export async function analyseFixtures(
     }
   }
 
-  const allPicks = [...picksByKey.values()];
+  const allPicks = [...picksByKey.values()].filter((pick) =>
+    options.targetMarket === "total_shots" ||
+    pick.market.trim().toLowerCase() !== "total shots",
+  );
+  const targetMarket = options.targetMarket;
+  if (targetMarket && targetMarket !== "all") {
+    return allPicks.filter((pick) => matchesTargetMarket(pick, targetMarket));
+  }
+  return allPicks;
+}
+
+export async function analyseFixtures(
+  fixturesWithOdds: FixtureWithOdds[],
+  options: AnalyseFixturesOptions = {},
+): Promise<Pick[]> {
+  const limit = Math.max(1, Math.min(50, Math.floor(options.limit ?? 6)));
+  const allPicks = await analyseFixtureCandidates(fixturesWithOdds, {
+    targetMarket: options.targetMarket,
+  });
   if (options.singleBestPerMatch) {
     const modelPricedMatches = new Set(
       fixturesWithOdds
@@ -510,4 +646,22 @@ export async function analyseFixtures(
   return allPicks
     .sort((a, b) => (b.ev ?? -Infinity) - (a.ev ?? -Infinity))
     .slice(0, limit);
+}
+
+export async function analyseAccumulator(
+  fixturesWithOdds: FixtureWithOdds[],
+  options: AccumulatorOptions & { targetMarket?: TargetMarket },
+): Promise<AccumulatorResult> {
+  const candidates = await analyseFixtureCandidates(fixturesWithOdds, {
+    targetMarket: options.targetMarket,
+  });
+  const modelPricedMatches = new Set(
+    fixturesWithOdds
+      .filter((fixture) => fixture.modelPriced)
+      .map((fixture) => `${fixture.home_team} vs ${fixture.away_team}`.toLowerCase()),
+  );
+  const eligible = candidates.filter((pick) =>
+    pick.dataQuality !== "limited" || modelPricedMatches.has(pick.match.toLowerCase()),
+  );
+  return buildAccumulator(eligible, options);
 }

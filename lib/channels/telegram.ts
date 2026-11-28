@@ -1,11 +1,16 @@
 import {
-  classifyIntent,
   extractPickLimit,
   extractRequestedMatch,
   extractTargetMarket,
+  parseChatIntent,
 } from "@/lib/ai/intent";
 import { extractBetsFromImage } from "@/lib/ai/extract";
-import { analyseFixtures, type FixtureWithOdds } from "@/lib/model/analyseFixtures";
+import {
+  analyseAccumulator,
+  analyseFixtures,
+  type FixtureWithOdds,
+} from "@/lib/model/analyseFixtures";
+import type { AccumulatorResult } from "@/lib/model/buildAccumulator";
 import { selectBestPick, selectSingleBestPick } from "@/lib/model/selectBestPick";
 import { extractedBetSchema, type ExtractedBet, type Pick } from "@/lib/stats/types";
 import {
@@ -147,13 +152,14 @@ function plainReply(message: string): string[] {
 async function textReply(text: string): Promise<string[]> {
   if (isHelpCommand(text)) return plainReply(WELCOME_MESSAGE);
 
-  const intent = await classifyIntent(text);
+  const parsedIntent = await parseChatIntent(text);
+  const intent = parsedIntent.intent;
   if (intent === "general" || intent === "explain_pick") {
     return plainReply("Ask for the best plays or name a match (Team A vs Team B). You can also upload a bet-slip screenshot for analysis.");
   }
 
   const targetMarket = extractTargetMarket(text);
-  const fixtureLimit = extractPickLimit(text) ?? 6;
+  const fixtureLimit = parsedIntent.gameCount ?? extractPickLimit(text) ?? 6;
   const fixtures = await getUpcomingOddsFixtures();
   if (intent === "analyse_match") {
     const requestedMatch = extractRequestedMatch(text);
@@ -181,6 +187,30 @@ async function textReply(text: string): Promise<string[]> {
       : plainReply("No picks are available for that market in the next 36 hours.");
   }
 
+  const accumulatorRequested = parsedIntent.gameCount !== undefined ||
+    parsedIntent.targetTotalOdds !== undefined ||
+    parsedIntent.riskProfile !== "balanced";
+  if (accumulatorRequested) {
+    if (fixtures.length === 0) {
+      return plainReply("No upcoming fixtures are scheduled in the next 36 hours.");
+    }
+    const accumulator = await analyseAccumulator(fixtures, {
+      ...(parsedIntent.gameCount !== undefined
+        ? { gameCount: parsedIntent.gameCount }
+        : parsedIntent.targetTotalOdds === undefined
+          ? { gameCount: fixtureLimit }
+          : {}),
+      ...(parsedIntent.targetTotalOdds !== undefined
+        ? { targetTotalOdds: parsedIntent.targetTotalOdds }
+        : {}),
+      riskProfile: parsedIntent.riskProfile,
+    });
+    if (!accumulator.reachedTarget || accumulator.legs.length === 0) {
+      return plainReply("I couldn't build an accumulator meeting the requested game count and odds target from available picks.");
+    }
+    return formatAccumulatorMessages(accumulator);
+  }
+
   const upcomingFixtures = fixtures.slice(0, fixtureLimit);
   if (upcomingFixtures.length === 0) {
     return plainReply("No upcoming fixtures are scheduled in the next 36 hours.");
@@ -195,6 +225,23 @@ async function textReply(text: string): Promise<string[]> {
   return bestPicks.length
     ? formatBestPickMessages(bestPicks)
     : plainReply("No statistical picks are available for the upcoming fixtures right now.");
+}
+
+function formatAccumulatorMessages(accumulator: AccumulatorResult): string[] {
+  const legMessages = formatBestPickMessages(accumulator.legs).map((message) =>
+    message.endsWith(`\n\n${DISCLAIMER}`)
+      ? message.slice(0, -(`\n\n${DISCLAIMER}`).length)
+      : message,
+  );
+  const summary = [
+    `Legs: ${accumulator.legs.length}`,
+    `Target Odds: ${accumulator.targetTotalOdds?.toString() ?? "not set"}`,
+    `Combined Accumulator Odds: ${accumulator.combinedOdds.toFixed(2)}`,
+  ].join(" | ");
+  if (accumulator.targetTotalOdds !== undefined || accumulator.riskProfile === "multi_combo") {
+    return [...legMessages, `${summary}\n\n${DISCLAIMER}`];
+  }
+  return [...legMessages, DISCLAIMER];
 }
 
 function isHelpCommand(text: string): boolean {

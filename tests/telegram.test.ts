@@ -9,7 +9,7 @@ import {
   sendTelegramMessages,
   splitTelegramMessage,
 } from "../lib/channels/telegram";
-import { analyseFixtures } from "../lib/model/analyseFixtures";
+import { analyseAccumulator, analyseFixtures } from "../lib/model/analyseFixtures";
 import { selectBestPick, selectSingleBestPick } from "../lib/model/selectBestPick";
 import { getUpcomingOddsFixtures, type OddsFixture } from "../lib/stats/oddsApi";
 import { GET, POST } from "../src/app/api/telegram/route";
@@ -20,6 +20,7 @@ vi.mock("../lib/ai/extract", () => ({
 }));
 
 vi.mock("../lib/model/analyseFixtures", () => ({
+  analyseAccumulator: vi.fn(),
   analyseFixtures: vi.fn(),
 }));
 
@@ -335,6 +336,47 @@ describe("Telegram reply helpers", () => {
       ]);
       vi.clearAllMocks();
     }
+  });
+
+  it("sends multi-combo legs as separate messages followed by an accumulator summary", async () => {
+    const fixtures: OddsFixture[] = [{
+      id: "multi-combo-fixture",
+      sport_key: "soccer_epl",
+      commence_time: "2026-12-01T19:00:00Z",
+      home_team: "Arsenal",
+      away_team: "Chelsea",
+      bookmakers: [],
+    }];
+    const legs = Array.from({ length: 6 }, (_, index) => ({
+      ...pick(`Selection ${index}`, 0.7 - index / 100),
+      match: `Home ${index} vs Away ${index}`,
+      market: index % 2 ? "1X2" : "Double Chance",
+      bookOdds: index % 2 ? 2 : 1.4,
+    }));
+    const combinedOdds = legs.reduce((total, leg) => total * (leg.bookOdds ?? 1), 1);
+    vi.mocked(getUpcomingOddsFixtures).mockResolvedValue(fixtures);
+    vi.mocked(analyseAccumulator).mockResolvedValue({
+      legs,
+      combinedOdds,
+      gameCount: 6,
+      riskProfile: "multi_combo",
+      reachedTarget: true,
+    });
+
+    const messages = await createTelegramReplyMessages({
+      chat: { id: 123 },
+      text: "6 multi combo games",
+    });
+
+    expect(analyseAccumulator).toHaveBeenCalledWith(fixtures, {
+      gameCount: 6,
+      riskProfile: "multi_combo",
+    });
+    expect(messages).toHaveLength(7);
+    expect(messages.slice(0, 6).every((message) => message.split("\n").length === 4)).toBe(true);
+    expect(messages[6]).toContain(
+      `Legs: 6 | Target Odds: not set | Combined Accumulator Odds: ${combinedOdds.toFixed(2)}`,
+    );
   });
 
   it("acknowledges and analyzes a replied-to image document from a Telegram webhook", async () => {

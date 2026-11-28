@@ -3,6 +3,7 @@ import {
   classifyIntent,
   extractRequestedMatch,
   extractTargetMarket,
+  parseBettingRequest,
   shouldOpenAnalysisBoard,
 } from "../lib/ai/intent";
 import { selectSingleBestPick } from "../lib/model/selectBestPick";
@@ -110,6 +111,25 @@ describe("punter conversation intent", () => {
     expect(extractTargetMarket("for correct score")).toBe("correct_score");
     expect(await classifyIntent("How should I structure a low-variance 3-fold?")).toBe("general");
     expect(await classifyIntent("For over/under")).toBe("analyse_match");
+  });
+
+  it("parses exact game counts, accumulator targets, and risk profiles", async () => {
+    const targetOnly = parseBettingRequest("safest plays today that would sum up to 10 odds");
+    const riskyTarget = parseBettingRequest("4 risky games to give 15 odds");
+    const multiCombo = parseBettingRequest("6 multi combo games");
+
+    expect(targetOnly).toEqual({ targetTotalOdds: 10, riskProfile: "safe" });
+    expect(riskyTarget).toEqual({
+      gameCount: 4,
+      targetTotalOdds: 15,
+      riskProfile: "risky",
+    });
+    expect(multiCombo).toEqual({ gameCount: 6, riskProfile: "multi_combo" });
+    expect(parseBettingRequest("6 games").gameCount).toBe(6);
+    expect(parseBettingRequest("10 odds").gameCount).toBeUndefined();
+    expect(parseBettingRequest("5 odds slip").targetTotalOdds).toBe(5);
+    await expect(classifyIntent("4 risky games to give 15 odds")).resolves.toBe("best_plays");
+    await expect(classifyIntent("6 multi combo games")).resolves.toBe("best_plays");
   });
 });
 

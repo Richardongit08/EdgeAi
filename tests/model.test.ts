@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { classifyIntent, extractPickLimit, extractRequestedMatch } from "../lib/ai/intent";
-import { analyseFixtures } from "../lib/model/analyseFixtures";
+import { analyseFixtureCandidates, analyseFixtures } from "../lib/model/analyseFixtures";
 import { buildScoreMatrix } from "../lib/model/poisson";
 import { deriveMarketProbabilities, matrixSum } from "../lib/model/markets";
 import { calculateValue, removeMargin } from "../lib/model/value";
@@ -222,6 +222,15 @@ describe("probability engine", () => {
     expect(picks).toHaveLength(1);
     expect(picks[0].bookOdds).toBeGreaterThan(1);
     expect(Number.isFinite(picks[0].bookOdds)).toBe(true);
+
+    const candidates = await analyseFixtureCandidates(fixtures);
+    const pricedCandidates = candidates.filter((pick) => pick.bookOdds !== null);
+    expect(candidates.every((pick) => pick.modelProb <= 0.9)).toBe(true);
+    expect(candidates.every((pick) => pick.market !== "Total Shots")).toBe(true);
+    expect(pricedCandidates.every((pick) =>
+      pick.bookOdds === Math.max(1.12, Number((1 / (pick.modelProb * 1.06)).toFixed(2))),
+    )).toBe(true);
+    expect(new Set(pricedCandidates.map((pick) => pick.bookOdds)).size).toBeGreaterThan(1);
 
     vi.stubEnv("ODDS_API_KEY", "");
     expect(await getUpcomingOddsFixtures()).toHaveLength(1);

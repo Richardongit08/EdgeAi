@@ -1,14 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  classifyIntent,
   extractPickLimit,
   extractRequestedMatch,
   extractTargetMarket,
   normalizeFootballQuestion,
+  parseChatIntent,
   type RequestedMatch,
 } from "@/lib/ai/intent";
 import { answerPunterQuestion, formatPunterPicks } from "@/lib/ai/punterChat";
-import { analyseFixtures } from "@/lib/model/analyseFixtures";
+import { analyseAccumulator, analyseFixtures } from "@/lib/model/analyseFixtures";
 import { findOddsFixture, getUpcomingOddsFixtures, type OddsFixture } from "@/lib/stats/oddsApi";
 import type { Pick } from "@/lib/stats/types";
 
@@ -54,6 +54,10 @@ function describePicks(picks: Pick[], fixtureCount: number): string {
   return formatPunterPicks(picks);
 }
 
+function formatRiskProfile(riskProfile: string): string {
+  return riskProfile.replace("_", "-");
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json()) as {
@@ -65,7 +69,8 @@ export async function POST(request: NextRequest) {
     }
 
     const message = body.message.trim();
-    const intent = await classifyIntent(message);
+    const parsedIntent = await parseChatIntent(message);
+    const intent = parsedIntent.intent;
     if (intent === "open_board") {
       return NextResponse.json({
         intent,
@@ -80,10 +85,51 @@ export async function POST(request: NextRequest) {
       : undefined;
     const requestedMatch = extractRequestedMatch(message) ?? lastMatchedFixture;
     const targetMarket = extractTargetMarket(message);
-    const limit = extractPickLimit(message) ?? 5;
+    const limit = parsedIntent.gameCount ?? extractPickLimit(message) ?? 5;
 
     if (intent === "best_plays") {
       const fixtures = await getUpcomingOddsFixtures();
+      const accumulatorRequested = targetMarket === "all" && (
+        parsedIntent.gameCount !== undefined ||
+        parsedIntent.targetTotalOdds !== undefined ||
+        parsedIntent.riskProfile !== "balanced"
+      );
+      if (accumulatorRequested) {
+        const accumulator = await analyseAccumulator(fixtures, {
+          ...(parsedIntent.gameCount !== undefined
+            ? { gameCount: parsedIntent.gameCount }
+            : parsedIntent.targetTotalOdds === undefined
+              ? { gameCount: limit }
+              : {}),
+          ...(parsedIntent.targetTotalOdds !== undefined
+            ? { targetTotalOdds: parsedIntent.targetTotalOdds }
+            : {}),
+          riskProfile: parsedIntent.riskProfile,
+        });
+        const picks = accumulator.reachedTarget ? accumulator.legs : [];
+        const reply = picks.length > 0
+          ? [
+              formatPunterPicks(picks),
+              `Legs: ${picks.length} | Target Odds: ${accumulator.targetTotalOdds?.toString() ?? "not set"} | Combined Accumulator Odds: ${accumulator.combinedOdds.toFixed(2)} | Risk Profile: ${formatRiskProfile(accumulator.riskProfile)}`,
+            ].join("\n\n")
+          : fixtures.length === 0
+            ? "No upcoming fixtures are scheduled in the next 36 hours."
+            : "I couldn't build an accumulator meeting the requested game count and odds target from available picks.";
+        return NextResponse.json({
+          intent,
+          openBoard: false,
+          reply,
+          picks,
+          accumulator: {
+            legs: picks.length,
+            combinedOdds: accumulator.combinedOdds,
+            targetTotalOdds: accumulator.targetTotalOdds,
+            riskProfile: accumulator.riskProfile,
+            reachedTarget: accumulator.reachedTarget,
+          },
+        });
+      }
+
       const picks = await analyseFixtures(fixtures, {
         limit,
         singleBestPerMatch: true,

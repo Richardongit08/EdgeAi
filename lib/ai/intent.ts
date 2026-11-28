@@ -1,6 +1,7 @@
 import { generateWithFallback } from "@/lib/ai/generate";
 
 export type ChatIntent = "best_plays" | "analyse_match" | "explain_pick" | "open_board" | "general";
+export type RiskProfile = "safe" | "balanced" | "risky" | "multi_combo";
 export type TargetMarket =
   | "all"
   | "goals"
@@ -11,6 +12,16 @@ export type TargetMarket =
   | "double_chance"
   | "draw_no_bet"
   | "asian_handicap";
+
+export interface ParsedBettingRequest {
+  gameCount?: number;
+  targetTotalOdds?: number;
+  riskProfile: RiskProfile;
+}
+
+export interface ParsedChatIntent extends ParsedBettingRequest {
+  intent: ChatIntent;
+}
 
 export interface RequestedMatch {
   home: string;
@@ -41,6 +52,42 @@ export function extractPickLimit(message: string): number | undefined {
   if (!match) return undefined;
   const value = Number(match[1]);
   return Number.isInteger(value) && value > 0 ? Math.min(value, 50) : undefined;
+}
+
+function hasExplicitRiskProfile(message: string): boolean {
+  return /\b(?:safe|safest|low[-\s]risk|risky|high[-\s]odds?|multi(?:[_\s-]*combo)?|combo|combination)\b/i.test(message);
+}
+
+export function parseBettingRequest(message: string): ParsedBettingRequest {
+  const targetOddsMatch = message.match(
+    /\b(?:(?:sum(?:\s+up\s+to)?|reach(?:\s+up\s+to)?|target(?:\s+total)?|to\s+give|give(?:\s+me)?)\s+)?(\d{1,3}(?:\.\d+)?)\s+odds\b/i,
+  );
+  const gameCountMatch = message.match(
+    /\b(\d{1,2})\s+(?:(?:safe|safest|risky|balanced|high[\s-]+odds|multi(?:[_\s-]+combo)?|combo|combination)\s+)?games?\b/i,
+  );
+  const riskProfile: RiskProfile = /\bmulti(?:[_\s-]*combo)?\b|\bcombo\b|\bcombination\b/i.test(message)
+    ? "multi_combo"
+    : /\brisky\b|\bhigh[-\s]odds?\b/i.test(message)
+      ? "risky"
+      : /\bsafe(?:st)?\b|\blow[-\s]risk\b/i.test(message)
+        ? "safe"
+        : "balanced";
+  const targetTotalOdds = targetOddsMatch ? Number(targetOddsMatch[1]) : undefined;
+  const gameCount = gameCountMatch ? Number(gameCountMatch[1]) : undefined;
+  return {
+    ...(gameCount !== undefined && gameCount > 0 ? { gameCount: Math.min(gameCount, 50) } : {}),
+    ...(targetTotalOdds !== undefined && targetTotalOdds > 1
+      ? { targetTotalOdds }
+      : {}),
+    riskProfile,
+  };
+}
+
+export async function parseChatIntent(message: string): Promise<ParsedChatIntent> {
+  return {
+    intent: await classifyIntent(message),
+    ...parseBettingRequest(message),
+  };
 }
 
 function isBestPlaysRequest(message: string): boolean {
@@ -82,6 +129,12 @@ export async function classifyIntent(message: string): Promise<ChatIntent> {
   if (
     /^\d{1,2}\s+.+\s+games?\b/i.test(normalized) &&
     extractTargetMarket(normalized) !== "all"
+  ) return "best_plays";
+  const bettingRequest = parseBettingRequest(normalized);
+  if (
+    bettingRequest.gameCount !== undefined ||
+    bettingRequest.targetTotalOdds !== undefined ||
+    hasExplicitRiskProfile(normalized)
   ) return "best_plays";
   if (/^(?:for|show|give me)\s+(?:the\s+)?(?:over|under|goals?|correct score|total shots?|btts|1x2|double chance|draw no bet|asian handicap)\b/i.test(normalized)) {
     return "analyse_match";
