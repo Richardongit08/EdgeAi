@@ -77,7 +77,10 @@ function configureSlipAnalysis(bets: ExtractedBet[]): void {
   });
 }
 
-function stubTelegramImageDownload(contentType = "application/octet-stream"): string[] {
+function stubTelegramImageDownload(
+  contentType = "application/octet-stream",
+  filePath = "photos/slip.jpg",
+): string[] {
   const requestedUrls: string[] = [];
   vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
     const url = input.toString();
@@ -85,7 +88,7 @@ function stubTelegramImageDownload(contentType = "application/octet-stream"): st
     if (url.includes("/getFile?file_id=")) {
       return new Response(JSON.stringify({
         ok: true,
-        result: { file_path: "photos/slip.jpg" },
+        result: { file_path: filePath },
       }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -151,6 +154,7 @@ describe("Telegram reply helpers", () => {
     const secondPick = {
       ...pick("Under 2.5", 0.62),
       match: "Liverpool vs Brighton",
+      market: "Goals Over/Under 2.5",
       bookOdds: null,
     };
     const messages = formatBestPickMessages([pick("Arsenal", 0.615), secondPick]);
@@ -160,13 +164,13 @@ describe("Telegram reply helpers", () => {
     expect(messages[0].split("\n")).toEqual([
       "Match: Arsenal vs Chelsea",
       "Probability: 61.5%",
-      "Pick: Arsenal",
+      "Pick: 1X2 — Home Win (Arsenal)",
       "odds: 2.15",
     ]);
     expect(messages[1].split("\n").slice(0, 4)).toEqual([
       "Match: Liverpool vs Brighton",
       "Probability: 62.0%",
-      "Pick: Under 2.5",
+      "Pick: Total Goals — Under 2.5",
       "odds: 1.61",
     ]);
     expect(messages[0]).not.toContain("Statistical justification:");
@@ -176,6 +180,38 @@ describe("Telegram reply helpers", () => {
     expect(reply).not.toContain("Unavailable");
     expect(reply).not.toContain("Statistical justification:");
     expect(reply.endsWith("Estimates only. No outcome is guaranteed. Gamble responsibly. 18+")).toBe(true);
+  });
+
+  it("formats explicit markets for common Telegram pick types", () => {
+    const formatted = [
+      { market: "BTTS", selection: "Yes", expected: "Pick: BTTS — Yes" },
+      { market: "Double Chance", selection: "12", expected: "Pick: Double Chance — 12 (Home or Away)" },
+      { market: "1X2", selection: "Draw", expected: "Pick: 1X2 — Draw (X)" },
+      { market: "1X2", selection: "Home Win (Arsenal) / 2UP", expected: "Pick: 1X2 — Home Win (1) / 2UP" },
+      { market: "Goals Over/Under 2.5", selection: "Over 2.5", expected: "Pick: Total Goals — Over 2.5" },
+      { market: "Asian Handicap", selection: "Home (+1.5)", expected: "Pick: Handicap — Arsenal +1.5" },
+      { market: "Correct Score", selection: "1-1", expected: "Pick: Correct Score — 1-1" },
+      { market: "Corners", selection: "Over 9.5", expected: "Pick: Corners — Over 9.5" },
+      { market: "Total Shots", selection: "Over 22.5 Shots", expected: "Pick: Shots — Over 22.5" },
+      { market: "Maccabi Tel Aviv FC Team Total Goals", selection: "Under 3.5 Goals", expected: "Pick: Team Total Goals — Maccabi Tel Aviv FC Under 3.5" },
+      { market: "2nd Half Total Goals", selection: "Over 0.5 Goals", expected: "Pick: 2nd Half Total Goals — Over 0.5 Goals" },
+    ].map(({ market, selection }) =>
+      formatBestPickMessages([{ ...pick(selection, 0.7), market }])[0].split("\n")[2],
+    );
+
+    expect(formatted).toEqual([
+      "Pick: BTTS — Yes",
+      "Pick: Double Chance — 12 (Home or Away)",
+      "Pick: 1X2 — Draw (X)",
+      "Pick: 1X2 — Home Win (1) / 2UP",
+      "Pick: Total Goals — Over 2.5",
+      "Pick: Handicap — Arsenal +1.5",
+      "Pick: Correct Score — 1-1",
+      "Pick: Corners — Over 9.5",
+      "Pick: Shots — Over 22.5",
+      "Pick: Team Total Goals — Maccabi Tel Aviv FC Under 3.5",
+      "Pick: 2nd Half Total Goals — Over 0.5 Goals",
+    ]);
   });
 
   it("prefers priced picks only within the high-probability candidates", () => {
@@ -224,7 +260,7 @@ describe("Telegram reply helpers", () => {
     expect(messages[0].split("\n").slice(0, 4)).toEqual([
       "Match: Home 11 vs Away 11",
       "Probability: 61.0%",
-      "Pick: Home 11",
+      "Pick: 1X2 — Home Win (Home 11)",
       "odds: 2.21",
     ]);
     expect(requestedUrls[0]).toContain("file_id=direct-document");
@@ -234,6 +270,56 @@ describe("Telegram reply helpers", () => {
     expect(vi.mocked(analyseFixtures).mock.calls.map(([fixtures]) =>
       fixtures[0].confirmedBets?.[0].odds,
     )).toEqual(createSlipBets(12).map((bet) => bet.odds));
+  });
+
+  it("uses the file extension when Telegram responds with application/octet-stream", async () => {
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    const requestedUrls = stubTelegramImageDownload("application/octet-stream", "photos/slip.png");
+    configureSlipAnalysis([{
+      home: "SportyBet Home",
+      away: "SportyBet Away",
+      market: "Goals Over/Under 3.5",
+      selection: "Under 3.5",
+      odds: 1.26,
+    }]);
+
+    const messages = await createTelegramReplyMessages({
+      chat: { id: 123 },
+      document: { file_id: "sportybet-slip", mime_type: "application/octet-stream" },
+    });
+
+    expect(messages).toHaveLength(1);
+    expect(requestedUrls[0]).toContain("file_id=sportybet-slip");
+    expect(extractBetsFromImage).toHaveBeenCalledWith("AQID", "image/png");
+    expect(vi.mocked(analyseFixtures).mock.calls[0][0][0].confirmedBets?.[0]).toMatchObject({
+      market: "Goals Over/Under 3.5",
+      selection: "Under 3.5",
+      odds: 1.26,
+    });
+  });
+
+  it("scores tipster screenshot picks when odds are absent and ranks by probability", async () => {
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    vi.stubEnv("ODDS_API_KEY", "");
+    stubTelegramImageDownload();
+    const bets: ExtractedBet[] = [
+      { home: "Home 0", away: "Away 0", market: "1X2", selection: "Home 0" },
+      { home: "Home 1", away: "Away 1", market: "BTTS", selection: "Yes" },
+      { home: "Home 2", away: "Away 2", market: "Double Chance", selection: "1X" },
+    ];
+    configureSlipAnalysis(bets);
+
+    const messages = await createTelegramReplyMessages({
+      chat: { id: 123 },
+      photo: [{ file_id: "tipster-image" }],
+    });
+
+    expect(messages[0]).toContain("Match: Home 2 vs Away 2");
+    expect(messages.map((message) => Number(message.match(/Probability: ([\d.]+)%/)?.[1])))
+      .toEqual([52, 51, 50]);
+    expect(vi.mocked(analyseFixtures).mock.calls.map(([fixtures]) =>
+      fixtures[0].confirmedBets?.[0].odds,
+    )).toEqual([undefined, undefined, undefined]);
   });
 
   it("reads the largest photo when the image is attached to a replied-to message", async () => {
@@ -328,10 +414,27 @@ describe("Telegram reply helpers", () => {
         targetMarket,
       });
       expect(messages).toHaveLength(1);
+      const formattedMarkets: Record<string, string> = {
+        "BTTS": "BTTS",
+        "Double Chance": "Double Chance",
+        "Correct Score": "Correct Score",
+        "Total Shots": "Shots",
+        "Goals Over/Under 2.5": "Total Goals",
+      };
+      const doubleChanceSelections: Record<string, string> = {
+        "1X": "1X (Home or Draw)",
+        "X2": "X2 (Draw or Away)",
+        "12": "12 (Home or Away)",
+      };
+      const formattedSelection = market === "Double Chance"
+        ? doubleChanceSelections[selection] ?? selection
+        : market === "Total Shots"
+          ? selection.replace(/\s+shots?$/i, "")
+          : selection;
       expect(messages[0].split("\n").slice(0, 4)).toEqual([
         "Match: Arsenal vs Chelsea",
         "Probability: 72.0%",
-        `Pick: ${selection}`,
+        `Pick: ${formattedMarkets[market] ?? "1X2"} — ${formattedSelection}`,
         "odds: 2.15",
       ]);
       vi.clearAllMocks();
@@ -412,6 +515,51 @@ describe("Telegram reply helpers", () => {
     expect(extractBetsFromImage).toHaveBeenCalledWith("AQID", "image/png");
   });
 
+  it("buffers Telegram media groups, sends one acknowledgment, and deduplicates fixtures", async () => {
+    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "test-secret");
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    vi.stubEnv("ODDS_API_KEY", "");
+    const { sentMessages } = stubTelegramWebhookFetch();
+    configureSlipAnalysis([
+      { home: "Arsenal", away: "Chelsea", market: "1X2", selection: "Arsenal", odds: 1.8 },
+      { home: " arsenal ", away: "CHELSEA!", market: "BTTS", selection: "Yes" },
+      { home: "Liverpool", away: "Brighton", market: "BTTS", selection: "Yes" },
+    ]);
+    const request = (updateId: number, fileId: string) => new NextRequest(
+      "https://edgeai.example/api/telegram",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-telegram-bot-api-secret-token": "test-secret",
+        },
+        body: JSON.stringify({
+          update_id: updateId,
+          message: {
+            chat: { id: 123 },
+            media_group_id: "album-123",
+            photo: [{ file_id: fileId }],
+          },
+        }),
+      },
+    );
+
+    const responses = await Promise.all([
+      POST(request(712036, "album-photo-1")),
+      POST(request(712037, "album-photo-2")),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(sentMessages.filter((message) => message === "Analysing your bet slip...")).toHaveLength(1);
+    expect(extractBetsFromImage).toHaveBeenCalledOnce();
+    expect(vi.mocked(extractBetsFromImage).mock.calls[0][0]).toEqual([
+      { base64Image: "AQID", mimeType: "image/jpeg" },
+      { base64Image: "AQID", mimeType: "image/jpeg" },
+    ]);
+    expect(analyseFixtures).toHaveBeenCalledTimes(2);
+    expect(sentMessages.filter((message) => message.startsWith("Match:"))).toHaveLength(2);
+  });
+
   it("notifies the chat if Telegram image processing throws", async () => {
     vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", "test-secret");
     vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
@@ -436,7 +584,7 @@ describe("Telegram reply helpers", () => {
     expect(response.status).toBe(200);
     expect(sentMessages).toEqual([
       "Analysing your bet slip...",
-      "I couldn't process that message. Please try again.",
+      "I couldn't process that message: vision request failed",
     ]);
   });
 

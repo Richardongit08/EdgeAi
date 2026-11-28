@@ -58,6 +58,14 @@ function parseGoals(value: number | string | undefined): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function poissonOverProbability(expected: number, line: number): number {
+  let atOrBelowLine = 0;
+  for (let goals = 0; goals <= Math.floor(line); goals += 1) {
+    atOrBelowLine += poissonProbability(expected, goals);
+  }
+  return Math.min(1, Math.max(0, 1 - atOrBelowLine));
+}
+
 function apiFootballForm(form: string | undefined): number[] {
   return (form ?? "")
     .toUpperCase()
@@ -134,6 +142,8 @@ function modelProbability(
   awayName: string,
   probabilities: MarketProbabilities,
   point?: number,
+  homeStats?: TeamStats,
+  awayStats?: TeamStats,
 ): number | undefined {
   const normalizedMarket = market.toLowerCase();
   const normalizedSelection = selection.toLowerCase();
@@ -145,8 +155,8 @@ function modelProbability(
     normalizedMarket.includes("full time result")
   ) {
     if (/draw|tie/.test(normalizedSelection)) return probabilities.draw;
-    if (/^(home|1)$/.test(normalizedSelection)) return probabilities.home;
-    if (/^(away|2)$/.test(normalizedSelection)) return probabilities.away;
+    if (/^(home|1)$/.test(normalizedSelection) || /\bhome win\b/.test(normalizedSelection)) return probabilities.home;
+    if (/^(away|2)$/.test(normalizedSelection) || /\baway win\b/.test(normalizedSelection)) return probabilities.away;
     const homeSimilarity = teamNameSimilarity(selection, homeName);
     const awaySimilarity = teamNameSimilarity(selection, awayName);
     if (homeSimilarity >= 0.55 && homeSimilarity > awaySimilarity) return probabilities.home;
@@ -170,6 +180,59 @@ function modelProbability(
     return undefined;
   }
 
+  if (/early|first half|1st half|2nd half/.test(normalizedMarket)) {
+    const line = point ?? Number((selection.match(/\d+(?:\.\d+)?/) ?? [])[0]);
+    if (!Number.isFinite(line)) return undefined;
+    const minutes = normalizedMarket.includes("2nd half") || normalizedMarket.includes("second half")
+      ? 45
+      : normalizedMarket.includes("early")
+        ? Number(normalizedMarket.match(/(\d{1,2})\s*(?:min|minute)/)?.[1] ?? 15)
+        : 45;
+    const probability = poissonOverProbability(
+      (probabilities.lambdaHome + probabilities.lambdaAway) * minutes / 90,
+      line,
+    );
+    if (/under/i.test(normalizedSelection)) return 1 - probability;
+    if (/over/i.test(normalizedSelection)) return probability;
+    return undefined;
+  }
+
+  if (/total shots|shots total/.test(normalizedMarket)) {
+    const line = point ?? Number((selection.match(/\d+(?:\.\d+)?/) ?? [])[0]);
+    const expected = homeStats?.shotsFor !== undefined && awayStats?.shotsFor !== undefined
+      ? (homeStats.shotsFor + awayStats.shotsFor) / 2
+      : undefined;
+    if (!Number.isFinite(line) || expected === undefined) return undefined;
+    if (/under/i.test(normalizedSelection)) return 1 - poissonOverProbability(expected, line);
+    if (/over/i.test(normalizedSelection)) return poissonOverProbability(expected, line);
+    return undefined;
+  }
+
+  if (/over|under/.test(normalizedSelection)) {
+    const homeSimilarity = Math.max(
+      teamNameSimilarity(market, homeName),
+      teamNameSimilarity(selection, homeName),
+    );
+    const awaySimilarity = Math.max(
+      teamNameSimilarity(market, awayName),
+      teamNameSimilarity(selection, awayName),
+    );
+    if (
+      /team total|team goals/.test(normalizedMarket) ||
+      Math.max(homeSimilarity, awaySimilarity) >= 0.55
+    ) {
+      const line = point ?? Number(
+        (selection.match(/\d+(?:\.\d+)?/) ?? market.match(/\d+(?:\.\d+)?/) ?? [])[0],
+      );
+      if (!Number.isFinite(line)) return undefined;
+      const expected = homeSimilarity > awaySimilarity || /\bhome\b/.test(normalizedSelection)
+        ? probabilities.lambdaHome
+        : probabilities.lambdaAway;
+      const probability = poissonOverProbability(expected, line);
+      return /under/.test(normalizedSelection) ? 1 - probability : probability;
+    }
+  }
+
   if (normalizedMarket === "totals" || normalizedMarket.includes("over") || normalizedMarket.includes("under") || /total/i.test(normalizedMarket)) {
     const line = point ?? Number((selection.match(/\d+(?:\.\d+)?/) ?? market.match(/\d+(?:\.\d+)?/))?.[0]);
     if (!Number.isFinite(line)) return undefined;
@@ -182,6 +245,10 @@ function modelProbability(
     if (/no|false/i.test(normalizedSelection)) return probabilities.bttsNo;
     if (/yes|true/i.test(normalizedSelection)) return probabilities.bttsYes;
     return undefined;
+  }
+
+  if (normalizedMarket.includes("correct score")) {
+    return probabilities.topCorrectScores.find((score) => score.score === selection)?.probability ?? 0.08;
   }
 
   if (normalizedMarket === "double_chance" || normalizedMarket.includes("double chance")) {
@@ -199,6 +266,8 @@ function modelProbability(
   if (normalizedMarket === "spreads" || normalizedMarket.includes("handicap") || normalizedMarket.includes("spread")) {
     const handicapPoint = point ?? Number(selection.match(/[+-]\s*\d+(?:\.\d+)?/)?.[0].replace(/\s/g, ""));
     if (!Number.isFinite(handicapPoint)) return undefined;
+    if (/^(home|1)\b/.test(normalizedSelection)) return probabilities.homeHandicap[String(handicapPoint)];
+    if (/^(away|2)\b/.test(normalizedSelection)) return probabilities.awayHandicap[String(handicapPoint)];
     const homeSimilarity = teamNameSimilarity(selection, homeName);
     const awaySimilarity = teamNameSimilarity(selection, awayName);
     if (homeSimilarity > awaySimilarity) return probabilities.homeHandicap[String(handicapPoint)];
@@ -398,6 +467,31 @@ function priorForPick(
   if (normalizedMarket.includes("btts")) {
     return /no|false/.test(normalizedSelection) ? leaguePrior.bttsNo : leaguePrior.bttsYes;
   }
+  if (/early|first half|1st half|2nd half/.test(normalizedMarket)) {
+    const line = Number((selection.match(/\d+(?:\.\d+)?/) ?? [])[0]);
+    if (Number.isFinite(line)) {
+      const minutes = normalizedMarket.includes("2nd half") || normalizedMarket.includes("second half")
+        ? 45
+        : normalizedMarket.includes("early")
+          ? Number(normalizedMarket.match(/(\d{1,2})\s*(?:min|minute)/)?.[1] ?? 15)
+          : 45;
+      const over = poissonOverProbability(
+        (leaguePrior.lambdaHome + leaguePrior.lambdaAway) * minutes / 90,
+        line,
+      );
+      return /under/.test(normalizedSelection) ? 1 - over : over;
+    }
+  }
+  if (/team total|team goals/.test(normalizedMarket)) {
+    const line = Number((selection.match(/\d+(?:\.\d+)?/) ?? [])[0]);
+    if (Number.isFinite(line)) {
+      const home = teamNameSimilarity(market, fixture.home_team) >= 0.55 ||
+        /\bhome\b/.test(normalizedSelection);
+      const expected = home ? leaguePrior.lambdaHome : leaguePrior.lambdaAway;
+      const over = poissonOverProbability(expected, line);
+      return /under/.test(normalizedSelection) ? 1 - over : over;
+    }
+  }
   if (normalizedMarket.includes("goals over/under") || normalizedMarket === "totals") {
     const line = Number((selection.match(/\d+(?:\.\d+)?/) ?? market.match(/\d+(?:\.\d+)?/) ?? [])[0]);
     if (Number.isFinite(line)) {
@@ -581,22 +675,35 @@ export async function analyseFixtureCandidates(
           fixture.home_team,
           fixture.away_team,
           probabilities,
+          undefined,
+          homeStats,
+          awayStats,
         );
         if (modelProb === undefined) return [];
-        const calibratedProb = calibrateModelProbability(
+        const calibratedProbability = calibrateModelProbability(
           bet.market,
           bet.selection,
           modelProb,
           fixture,
           leaguePrior,
         );
+        const hasBookOdds = bet.odds !== undefined &&
+          bet.odds !== null &&
+          Number.isFinite(bet.odds) &&
+          bet.odds > 1;
+        const calibratedProb = hasBookOdds
+          ? calibratedProbability * 0.7 + (1 / bet.odds!) * 0.3
+          : Math.min(0.83, Math.max(0.56, calibratedProbability));
+        const price = hasBookOdds
+          ? bet.odds!
+          : Math.max(1.18, Number((1 / (calibratedProb * 1.06)).toFixed(2)));
         return [makePick(
           fixture,
           bet.market,
           bet.selection,
           calibratedProb,
           statsInfo,
-          bet.odds && bet.odds > 1 ? { price: bet.odds, fairProb: 1 / bet.odds } : undefined,
+          { price, fairProb: 1 / price },
         )];
       }),
     ];

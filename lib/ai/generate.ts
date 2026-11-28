@@ -2,18 +2,21 @@ import { GoogleGenAI } from "@google/genai";
 import type { ContentListUnion } from "@google/genai";
 
 export function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY || process.env.LLM_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.LLM_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is not configured.");
   return new GoogleGenAI({ apiKey, httpOptions: { timeout: 6000 } });
 }
 
 function shouldFallback(error: unknown): boolean {
   if (error instanceof Error) {
-    if (/timed out|timeout|503|429/i.test(error.message)) return true;
+    if (/timed out|timeout|404|429|503/i.test(error.message)) return true;
   }
   if (typeof error === "object" && error !== null && "status" in error) {
     const status = (error as { status?: number }).status;
-    return status === 503 || status === 429;
+    return status === 404 || status === 429 || status === 503;
   }
   return false;
 }
