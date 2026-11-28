@@ -1,7 +1,7 @@
 import { classifyIntent, extractPickLimit, extractRequestedMatch } from "@/lib/ai/intent";
 import { extractBetsFromImage } from "@/lib/ai/extract";
 import { analyseFixtures, type FixtureWithOdds } from "@/lib/model/analyseFixtures";
-import { selectBestPick } from "@/lib/model/selectBestPick";
+import { selectBestPick, selectSingleBestPick } from "@/lib/model/selectBestPick";
 import { extractedBetSchema, type ExtractedBet, type Pick } from "@/lib/stats/types";
 import {
   findOddsFixture,
@@ -17,7 +17,14 @@ const MAX_PICKS_PER_FIXTURE = 50;
 export interface TelegramMessage {
   chat: { id: number | string };
   text?: string;
+  caption?: string;
   photo?: Array<{ file_id: string }>;
+  document?: { file_id: string; mime_type?: string };
+  reply_to_message?: {
+    caption?: string;
+    photo?: Array<{ file_id: string }>;
+    document?: { file_id: string; mime_type?: string };
+  };
 }
 
 interface TelegramApiResponse<T> {
@@ -28,6 +35,11 @@ interface TelegramApiResponse<T> {
 
 interface TelegramFile {
   file_path?: string;
+}
+
+interface TelegramImage {
+  fileId: string;
+  mimeType?: string;
 }
 
 const WELCOME_MESSAGE =
@@ -183,21 +195,39 @@ function fixtureForBet(bet: ExtractedBet, fixtures: OddsFixture[], index: number
       };
 }
 
-async function photoReply(message: TelegramMessage): Promise<string> {
+function getTelegramImage(message: TelegramMessage): TelegramImage | undefined {
   const photo = message.photo?.at(-1);
-  if (!photo) return "I couldn't read a photo from that message.";
+  if (photo) return { fileId: photo.file_id };
 
+  const document = message.document;
+  if (document?.mime_type?.startsWith("image/")) {
+    return { fileId: document.file_id, mimeType: document.mime_type };
+  }
+
+  const replyPhoto = message.reply_to_message?.photo?.at(-1);
+  if (replyPhoto) return { fileId: replyPhoto.file_id };
+
+  const replyDocument = message.reply_to_message?.document;
+  if (replyDocument?.mime_type?.startsWith("image/")) {
+    return { fileId: replyDocument.file_id, mimeType: replyDocument.mime_type };
+  }
+}
+
+async function photoReply(
+  telegramImage: TelegramImage,
+  instructionText: string,
+): Promise<string[]> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   const file = await telegramApi<TelegramFile>(
-    `getFile?file_id=${encodeURIComponent(photo.file_id)}`,
+    `getFile?file_id=${encodeURIComponent(telegramImage.fileId)}`,
   );
-  if (!file.file_path) throw new Error("Telegram did not return a photo file path.");
+  if (!file.file_path) throw new Error("Telegram did not return an image file path.");
 
   const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`, {
     cache: "no-store",
   });
-  if (!response.ok) throw new Error("Could not download the Telegram photo.");
+  if (!response.ok) throw new Error("Could not download the Telegram image.");
   const contentLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_BYTES) {
     throw new Error("Bet-slip images must be smaller than 10 MB.");
@@ -207,13 +237,15 @@ async function photoReply(message: TelegramMessage): Promise<string> {
     throw new Error("Bet-slip images must be smaller than 10 MB.");
   }
 
-  const contentType = response.headers.get("content-type")?.split(";")[0] ?? "image/jpeg";
-  const mimeType = contentType.startsWith("image/") ? contentType : "image/jpeg";
+  const responseMimeType = response.headers.get("content-type")?.split(";")[0];
+  const mimeType = responseMimeType?.startsWith("image/")
+    ? responseMimeType
+    : telegramImage.mimeType ?? "image/jpeg";
   const bets = extractedBetSchema.array().parse(
     await extractBetsFromImage(Buffer.from(image).toString("base64"), mimeType),
   );
   if (bets.length === 0) {
-    return "I couldn't identify any confirmed bet legs in that screenshot.";
+    return plainReply("I couldn't read the team names clearly from that screenshot. Send a clearer or split screenshot and I'll rank the top options.");
   }
 
   const availableFixtures = await getUpcomingOddsFixtures();
@@ -221,7 +253,7 @@ async function photoReply(message: TelegramMessage): Promise<string> {
   const analyses = await Promise.all(fixtureBets.map((fixture) =>
     analyseFixtures([fixture], { limit: MAX_PICKS_PER_FIXTURE }),
   ));
-  const legs = bets.map((bet, index) => {
+  const scoredPicks = bets.flatMap((bet, index) => {
     const fixture = fixtureBets[index];
     const matchName = `${fixture.home_team} vs ${fixture.away_team}`;
     const pick = analyses[index].find((candidate) =>
@@ -229,19 +261,23 @@ async function photoReply(message: TelegramMessage): Promise<string> {
       candidate.market.toLowerCase() === bet.market.toLowerCase() &&
       candidate.selection.toLowerCase() === bet.selection.toLowerCase(),
     );
-    if (!pick) {
-      return `${index + 1}. ${matchName} — ${bet.market}: ${bet.selection}\nProbability: unavailable; the model couldn't map this leg to a supported market.\nValue check: unavailable.`;
-    }
-    const valueCheck = pick.bookOdds === null || pick.ev === null
-      ? "Odds unavailable; value cannot be calculated."
-      : `${pick.ev > 0 ? "Potential value" : "No model value"} (model expected value ${((pick.ev ?? 0) * 100).toFixed(1)}%; decimal odds ${pick.bookOdds.toFixed(2)}).`;
-    return `${index + 1}. ${matchName} — ${bet.market}: ${bet.selection}\nProbability: ${(pick.modelProb * 100).toFixed(1)}% hit chance.\nValue check: ${valueCheck}`;
+    return pick ? [pick] : [];
   });
-  return `${legs.join("\n\n")}\n\n${DISCLAIMER}`;
+  if (scoredPicks.length === 0) {
+    return plainReply("I couldn't calculate probabilities for the extracted matches.");
+  }
+
+  const limit = extractPickLimit(instructionText) ?? 10;
+  const rankedPicks = selectSingleBestPick(scoredPicks, { limit });
+  return formatBestPickMessages(rankedPicks);
 }
 
 export async function createTelegramReplyMessages(message: TelegramMessage): Promise<string[]> {
-  if (message.photo?.length) return [await photoReply(message)];
+  const image = getTelegramImage(message);
+  if (image) {
+    const instructionText = message.caption || message.text || message.reply_to_message?.caption || "";
+    return photoReply(image, instructionText);
+  }
   if (typeof message.text === "string" && message.text.trim()) {
     return textReply(message.text.trim());
   }

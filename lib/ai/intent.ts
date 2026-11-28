@@ -31,7 +31,7 @@ export function extractRequestedMatch(message: string): RequestedMatch | undefin
 }
 
 export function extractPickLimit(message: string): number | undefined {
-  const match = message.match(/\b(?:give\s+me|show\s+me|top)\s+(\d{1,2})\s+(?:games?|picks?)\b/i);
+  const match = message.match(/\b(?:give(?:\s+me)?|show\s+me|top)\s+(\d{1,2})\s+(?:(?:best\s+)?(?:games?|picks?|options?))\b/i);
   if (!match) return undefined;
   const value = Number(match[1]);
   return Number.isInteger(value) && value > 0 ? Math.min(value, 50) : undefined;
