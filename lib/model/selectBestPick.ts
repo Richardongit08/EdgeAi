@@ -21,3 +21,8 @@ export function selectBestPick(picks: Pick[], targetMarket = "all"): Pick | unde
 
   return [...picks].sort(compareProbability)[0];
 }
+
+export function selectSingleBestPick(picks: Pick[], targetMarket = "all"): Pick | undefined {
+  return selectBestPick(picks, targetMarket);
+}
+

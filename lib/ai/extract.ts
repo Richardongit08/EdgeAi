@@ -6,7 +6,9 @@ export async function extractBetsFromImage(base64Image: string, mimeType: string
     [{
       role: "user",
       parts: [
-        { text: "Extract every visible bet. Return JSON with a 'bets' array containing home, away, optional league/date, market, selection, and decimal odds. Never infer missing values." },
+        {
+          text: "Read this tall vertical bet-slip screenshot (SportyBet, Bet9ja, etc.) from top to bottom. Extract every visible match, including home team, away team, optional league/date, market, selection, and decimal odds. Return JSON with a 'bets' array. Never infer missing values or hallucinate teams.",
+        },
         { inlineData: { mimeType, data: base64Image } },
       ],
     }],
