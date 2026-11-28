@@ -112,22 +112,65 @@ export function getMarketOdds(
   market: string,
 ): number | null {
   if (!fixture) return null;
-  const wantedMarket = market.toLowerCase().includes("over") || market.toLowerCase().includes("under")
+  const normalizedMarket = market.toLowerCase();
+  const isDoubleChance = normalizedMarket.includes("double chance");
+  const wantedMarket = normalizedMarket.includes("over") || normalizedMarket.includes("under") ||
+    normalizedMarket.includes("total")
     ? "totals"
-    : market.toLowerCase().includes("spread") || market.toLowerCase().includes("handicap")
+    : normalizedMarket.includes("spread") || normalizedMarket.includes("handicap")
       ? "spreads"
       : "h2h";
+  const normalizedSelection = selection.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const line = Number((selection.match(/[+-]?\s*\d+(?:\.\d+)?/) ?? market.match(/[+-]?\s*\d+(?:\.\d+)?/))?.[0].replace(/\s/g, ""));
+
+  if (isDoubleChance) {
+    const match = normalizedSelection.match(/1x|x2|12/);
+    if (!match) return null;
+    const neededNames = match[0] === "1x" ? ["home", "draw"]
+      : match[0] === "x2" ? ["draw", "away"] : ["home", "away"];
+    for (const bookmaker of fixture.bookmakers) {
+      const outcomes = bookmaker.markets.find((item) => item.key === "h2h")?.outcomes ?? [];
+      const prices = neededNames.map((name) => {
+        const outcome = outcomes.find((item) => {
+          const outcomeName = item.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (name === "draw") return /^(draw|tie|x)$/.test(outcomeName);
+          if (name === "home") {
+            return /^(home|1)$/.test(outcomeName) ||
+              teamNameSimilarity(item.name, fixture.home_team) >= 0.72;
+          }
+          return /^(away|2)$/.test(outcomeName) ||
+            teamNameSimilarity(item.name, fixture.away_team) >= 0.72;
+        });
+        return outcome?.price;
+      });
+      const validPrices = prices.filter((price): price is number =>
+        price !== undefined && Number.isFinite(price) && price > 1,
+      );
+      if (validPrices.length === 2) {
+        const combinedOdds = 1 / validPrices.reduce((sum, price) => sum + 1 / price, 0);
+        if (Number.isFinite(combinedOdds) && combinedOdds > 1) return combinedOdds;
+      }
+    }
+    return null;
+  }
+
   for (const bookmaker of fixture.bookmakers) {
     const marketData = bookmaker.markets.find((item) => item.key === wantedMarket);
     if (!marketData) continue;
-    const normalizedSelection = selection.toLowerCase();
-    const line = Number((selection.match(/\d+(?:\.\d+)?/) ?? market.match(/\d+(?:\.\d+)?/))?.[0]);
     const outcome = marketData.outcomes.find((item) => {
-      const selectionMatches =
-        item.name.toLowerCase().includes(normalizedSelection) ||
-        normalizedSelection.includes(item.name.toLowerCase());
+      const outcomeName = item.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+      const selectionMatches = outcomeName === normalizedSelection ||
+        normalizedSelection.startsWith(outcomeName) ||
+        (/^(home|1)$/.test(normalizedSelection) &&
+          (/^(home|1)$/.test(outcomeName) || teamNameSimilarity(item.name, fixture.home_team) >= 0.72)) ||
+        (/^(away|2)$/.test(normalizedSelection) &&
+          (/^(away|2)$/.test(outcomeName) || teamNameSimilarity(item.name, fixture.away_team) >= 0.72)) ||
+        (/^(draw|tie|x)$/.test(normalizedSelection) && /^(draw|tie|x)$/.test(outcomeName)) ||
+        teamNameSimilarity(selection, item.name) >= 0.72;
       const totalMatches = wantedMarket !== "totals" || !Number.isFinite(line) || item.point === line;
-      return selectionMatches && totalMatches;
+      const spreadMatches = wantedMarket !== "spreads" || !Number.isFinite(line) || item.point === line;
+      return selectionMatches && totalMatches && spreadMatches &&
+        Number.isFinite(item.price) && item.price > 1;
     });
     if (outcome) return outcome.price;
   }

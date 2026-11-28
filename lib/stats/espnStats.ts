@@ -221,6 +221,7 @@ export function leagueAverageTeamStats(leagueAvgGoals = 2.65): TeamStats {
   return {
     form: [],
     sampleSize: baselineSample,
+    isLeagueAverageBaseline: true,
     goalsForHome: baselineGoals,
     goalsAgainstHome: baselineGoals,
     goalsForAway: baselineGoals,

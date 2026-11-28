@@ -14,6 +14,7 @@ import {
 } from "@/lib/stats/espnStats";
 import { teamNameSimilarity } from "@/lib/stats/fuzzy";
 import {
+  getMarketOdds,
   getSportKeyForLeague,
   type OddsFixture,
 } from "@/lib/stats/oddsApi";
@@ -265,6 +266,22 @@ function modelOnlyCandidates(
   return candidates;
 }
 
+function makeDoubleChanceCandidates(
+  fixture: OddsFixture,
+  probabilities: MarketProbabilities,
+): PricedOutcome[] {
+  return [
+    { selection: "1X", modelProb: probabilities.doubleChance.homeOrDraw },
+    { selection: "12", modelProb: probabilities.doubleChance.homeOrAway },
+    { selection: "X2", modelProb: probabilities.doubleChance.drawOrAway },
+  ].flatMap(({ selection, modelProb }) => {
+    const odds = getMarketOdds(fixture, selection, "Double Chance");
+    return odds === null
+      ? []
+      : [{ market: "Double Chance", selection, modelProb, odds, fairProb: 1 / odds }];
+  });
+}
+
 function makePick(
   fixture: OddsFixture,
   market: string,
@@ -365,6 +382,12 @@ export async function analyseFixtures(
         makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo),
       ),
       ...makeOddsCandidates(fixture, probabilities).map((candidate) =>
+        makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo, {
+          price: candidate.odds,
+          fairProb: candidate.fairProb,
+        }),
+      ),
+      ...makeDoubleChanceCandidates(fixture, probabilities).map((candidate) =>
         makePick(fixture, candidate.market, candidate.selection, candidate.modelProb, statsInfo, {
           price: candidate.odds,
           fairProb: candidate.fairProb,

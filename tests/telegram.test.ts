@@ -1,10 +1,13 @@
 import { NextRequest } from "next/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  formatBestPickMessages,
   formatBestPicks,
   selectHighestProbabilityPick,
+  sendTelegramMessages,
   splitTelegramMessage,
 } from "../lib/channels/telegram";
+import { selectBestPick } from "../lib/model/selectBestPick";
 import { GET, POST } from "../src/app/api/telegram/route";
 import type { Pick } from "../lib/stats/types";
 
@@ -30,14 +33,63 @@ describe("Telegram reply helpers", () => {
     expect(selectHighestProbabilityPick([highValue, highProbability])).toBe(highProbability);
   });
 
-  it("formats one pick with odds, chance, statistical justification, and disclaimer", () => {
+  it("formats picks as separate four-line messages with numeric odds", () => {
+    const secondPick = {
+      ...pick("Under 2.5", 0.62),
+      match: "Liverpool vs Brighton",
+      bookOdds: null,
+    };
+    const messages = formatBestPickMessages([pick("Arsenal", 0.615), secondPick]);
     const reply = formatBestPicks([pick("Arsenal", 0.615)]);
 
-    expect(reply).toContain("Match: Arsenal vs Chelsea");
-    expect(reply).toContain("Arsenal (61.5% win/hit chance)");
-    expect(reply).toContain("Decimal odds: 2.15");
-    expect(reply).toContain("Statistical justification: The Poisson model");
+    expect(messages).toHaveLength(2);
+    expect(messages[0].split("\n")).toEqual([
+      "Match: Arsenal vs Chelsea",
+      "Probability: 61.5%",
+      "Pick: Arsenal",
+      "odds: 2.15",
+    ]);
+    expect(messages[1].split("\n").slice(0, 4)).toEqual([
+      "Match: Liverpool vs Brighton",
+      "Probability: 62.0%",
+      "Pick: Under 2.5",
+      "odds: 1.61",
+    ]);
+    expect(messages[0]).not.toContain("Statistical justification:");
+    expect(messages[1]).not.toContain("Statistical justification:");
+    expect(messages[0]).not.toContain("18+");
+    expect(messages[1].endsWith("Estimates only. No outcome is guaranteed. Gamble responsibly. 18+")).toBe(true);
+    expect(reply).not.toContain("Unavailable");
+    expect(reply).not.toContain("Statistical justification:");
     expect(reply.endsWith("Estimates only. No outcome is guaranteed. Gamble responsibly. 18+")).toBe(true);
+  });
+
+  it("prefers priced picks only within the high-probability candidates", () => {
+    const unpricedHighProbability = { ...pick("Home", 0.78), bookOdds: null };
+    const pricedHighProbability = { ...pick("Double Chance", 0.65), bookOdds: 1.45 };
+    const pricedLowProbability = { ...pick("Away", 0.42), bookOdds: 2.8 };
+
+    expect(selectBestPick([
+      unpricedHighProbability,
+      pricedHighProbability,
+      pricedLowProbability,
+    ])).toBe(pricedHighProbability);
+  });
+
+  it("sends a batch as sequential, separate Telegram messages", async () => {
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-token");
+    const sentMessages: string[] = [];
+    vi.stubGlobal("fetch", async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { text: string };
+      sentMessages.push(body.text);
+      return new Response(JSON.stringify({ ok: true, result: { message_id: sentMessages.length } }), {
+        status: 200,
+      });
+    });
+
+    await sendTelegramMessages(123, ["first pick", "second pick"]);
+
+    expect(sentMessages).toEqual(["first pick", "second pick"]);
   });
 
   it("splits long plain-text messages without exceeding Telegram's limit", () => {
