@@ -14,7 +14,7 @@ export function FilterBar({ sort, market, markets, onSort, onMarket }: Props) {
       <select
         value={sort}
         onChange={(event) => onSort(event.target.value as Props["sort"])}
-        className="rounded-lg border border-white/10 bg-[#171a21] px-3 py-2 text-sm text-slate-200"
+        className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-slate-400"
         aria-label="Sort picks"
       >
         <option value="ev">Sort: expected value</option>
@@ -24,7 +24,7 @@ export function FilterBar({ sort, market, markets, onSort, onMarket }: Props) {
       <select
         value={market}
         onChange={(event) => onMarket(event.target.value)}
-        className="rounded-lg border border-white/10 bg-[#171a21] px-3 py-2 text-sm text-slate-200"
+        className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-slate-400"
         aria-label="Filter market"
       >
         <option value="all">All markets</option>
