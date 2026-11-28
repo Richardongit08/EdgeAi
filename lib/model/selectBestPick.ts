@@ -1,4 +1,5 @@
-import type { Pick, TargetMarket } from "@/lib/stats/types";
+import type { TargetMarket } from "@/lib/ai/intent";
+import type { Pick } from "@/lib/stats/types";
 
 const HIGH_PROBABILITY_THRESHOLD = 0.5;
 
@@ -22,13 +23,37 @@ export function selectBestPick(picks: Pick[], targetMarket = "all"): Pick | unde
   return [...picks].sort(compareProbability)[0];
 }
 
+function matchesTargetMarket(pick: Pick, targetMarket: Exclude<TargetMarket, "all">): boolean {
+  const market = pick.market.trim().toLowerCase();
+  switch (targetMarket) {
+    case "goals":
+      return market.startsWith("goals over/under");
+    case "correct_score":
+      return market === "correct score";
+    case "total_shots":
+      return market === "total shots";
+    case "btts":
+      return market === "btts";
+    case "1x2":
+      return market === "1x2";
+    case "double_chance":
+      return market === "double chance";
+    case "draw_no_bet":
+      return market === "draw no bet";
+    case "asian_handicap":
+      return market === "asian handicap";
+    default:
+      return false;
+  }
+}
+
 export function selectSingleBestPick(
   candidates: Pick[],
   options?: { targetMarket?: TargetMarket; limit?: number },
 ): Pick[] {
   const targetMarket = options?.targetMarket;
   const filtered = targetMarket !== undefined && targetMarket !== "all"
-    ? candidates.filter((pick) => pick.market.toLowerCase() === targetMarket.toLowerCase())
+    ? candidates.filter((pick) => matchesTargetMarket(pick, targetMarket))
     : candidates;
   const bestByMatch = new Map<string, Pick>();
 

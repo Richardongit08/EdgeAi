@@ -25,18 +25,36 @@ const cache = new Map<string, CacheEntry<OddsFixture[]>>();
 const TTL_MS = 30 * 60 * 1000;
 export const ODDS_SPORT_KEYS = [
   "soccer_epl",
-  "soccer_germany_bundesliga",
-  "soccer_italy_serie_a",
-  "soccer_spain_la_liga",
-  "soccer_france_ligue_one",
   "soccer_efl_champ",
+  "soccer_germany_bundesliga",
+  "soccer_germany_bundesliga_2",
+  "soccer_italy_serie_a",
+  "soccer_italy_serie_b",
+  "soccer_spain_la_liga",
+  "soccer_spain_segunda_division",
+  "soccer_france_ligue_one",
+  "soccer_netherlands_eredivisie",
+  "soccer_portugal_primeira_liga",
+  "soccer_sco_premiership",
+  "soccer_belgium_first_div",
+  "soccer_turkey_super_league",
   "soccer_uefa_champs_league",
   "soccer_uefa_europa_league",
+  "soccer_uefa_europa_conference_league",
 ] as const;
 
 export function getSportKeyForLeague(league?: string): string {
   const value = (league ?? "").toLowerCase();
+  if (/2\.?\s*bundesliga|bundesliga 2/.test(value)) return "soccer_germany_bundesliga_2";
+  if (/serie b/.test(value)) return "soccer_italy_serie_b";
+  if (/segunda/.test(value)) return "soccer_spain_segunda_division";
   if (/bundesliga|germany|german/.test(value)) return "soccer_germany_bundesliga";
+  if (/eredivisie|netherlands|dutch/.test(value)) return "soccer_netherlands_eredivisie";
+  if (/primeira|portugal|portuguese/.test(value)) return "soccer_portugal_primeira_liga";
+  if (/scottish|scotland|premiership/.test(value)) return "soccer_sco_premiership";
+  if (/belgian|belgium|pro league/.test(value)) return "soccer_belgium_first_div";
+  if (/turkish|turkey|süper|super lig/.test(value)) return "soccer_turkey_super_league";
+  if (/conference league/.test(value)) return "soccer_uefa_europa_conference_league";
   if (/serie a|italy|italian/.test(value)) return "soccer_italy_serie_a";
   if (/la liga|spain|spanish/.test(value)) return "soccer_spain_la_liga";
   if (/ligue 1|france|french/.test(value)) return "soccer_france_ligue_one";
@@ -57,7 +75,7 @@ export async function getLiveOdds(sportKey: string): Promise<OddsFixture[]> {
   const url = new URL(`https://api.the-odds-api.com/v4/sports/${sportKey}/odds`);
   url.searchParams.set("apiKey", apiKey);
   url.searchParams.set("regions", "eu");
-  url.searchParams.set("markets", "h2h,totals,spreads");
+  url.searchParams.set("markets", "h2h,totals,spreads,btts,draw_no_bet,double_chance");
   url.searchParams.set("oddsFormat", "decimal");
   try {
     const response = await fetch(url, {
@@ -78,9 +96,13 @@ export async function getLiveOdds(sportKey: string): Promise<OddsFixture[]> {
 export async function getUpcomingOddsFixtures(): Promise<OddsFixture[]> {
   const results = await Promise.allSettled(ODDS_SPORT_KEYS.map((sportKey) => getLiveOdds(sportKey)));
   const now = Date.now();
+  const end = now + 36 * 60 * 60 * 1000;
   return results.flatMap((result) =>
     result.status === "fulfilled"
-      ? result.value.filter((fixture) => Date.parse(fixture.commence_time) >= now)
+      ? result.value.filter((fixture) => {
+          const kickoff = Date.parse(fixture.commence_time);
+          return kickoff >= now && kickoff <= end;
+        })
       : [],
   ).sort((a, b) => Date.parse(a.commence_time) - Date.parse(b.commence_time));
 }

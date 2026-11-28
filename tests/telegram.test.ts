@@ -88,7 +88,7 @@ describe("Telegram reply helpers", () => {
       probabilityTieHigherEv,
       otherMatch,
       wrongMarket,
-    ], { targetMarket: "1X2", limit: 1 })).toEqual([probabilityTieHigherEv]);
+    ], { targetMarket: "1x2", limit: 1 })).toEqual([probabilityTieHigherEv]);
     expect(selectSingleBestPick([highProbability, wrongMarket], { targetMarket: "all" })).toEqual([
       wrongMarket,
     ]);

@@ -12,8 +12,6 @@ export const extractedBetSchema = z.object({
 
 export type ExtractedBet = z.infer<typeof extractedBetSchema>;
 
-export type TargetMarket = string;
-
 export interface TeamStats {
   form: number[];
   sampleSize?: number;

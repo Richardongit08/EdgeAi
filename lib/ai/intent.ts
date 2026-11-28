@@ -1,6 +1,16 @@
 import { generateWithFallback } from "@/lib/ai/generate";
 
-export type ChatIntent = "best_plays" | "analyse_match" | "explain_pick" | "general";
+export type ChatIntent = "best_plays" | "analyse_match" | "explain_pick" | "open_board" | "general";
+export type TargetMarket =
+  | "all"
+  | "goals"
+  | "correct_score"
+  | "total_shots"
+  | "btts"
+  | "1x2"
+  | "double_chance"
+  | "draw_no_bet"
+  | "asian_handicap";
 
 export interface RequestedMatch {
   home: string;
@@ -8,17 +18,16 @@ export interface RequestedMatch {
 }
 
 export function extractRequestedMatch(message: string): RequestedMatch | undefined {
-  const cleaned = message.trim()
-    .replace(/^please\s+/i, "")
-    .replace(/^(?:can|could|would)\s+you\s+/i, "")
+  const cleaned = normalizeFootballQuestion(message)
+    .replace(/^(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?/i, "")
+    .replace(/^(?:what(?:'s| is)\s+)?(?:the\s+)?(?:safest|best|strongest|likely)\s+(?:play|pick|bet)\s+(?:in|for)\s+/i, "")
     .replace(/^(?:analyse|analyze|analysis(?:\s+of)?|break\s+down|look\s+at|check|tell\s+me\s+about)\s+/i, "")
     .replace(/^(?:the\s+)?(?:fixture|match|game)\s+/i, "")
-    .replace(/^for\s+/i, "")
-    .replace(/\s+(?:tonight|today|tomorrow|this\s+(?:evening|weekend|week)|next\s+(?:week|weekend))\b.*$/i, "")
+    .replace(/[?!]+$/g, "")
     .trim();
-  const match = cleaned.match(/^(.+?)\s+(?:vs|versus|v)\s+(.+?)$/i);
+  const match = cleaned.match(/^(.+?)\s+(?:vs|versus|v)\s+(.+?)(?:\s+(?:tonight|today|tomorrow|this\s+(?:evening|weekend|week)|next\s+(?:week|weekend)|for\s+.+))?$/i);
   if (!match) return undefined;
-  return { home: match[1].trim(), away: match[2].trim() };
+  return { home: match[1].trim(), away: match[2].trim().replace(/[?!.,]+$/g, "") };
 }
 
 export function extractPickLimit(message: string): number | undefined {
@@ -29,27 +38,59 @@ export function extractPickLimit(message: string): number | undefined {
 }
 
 function isBestPlaysRequest(message: string): boolean {
-  return /\bbest\s+plays?\b|\bhigh\s+probability\b|\bsafest\b|\btop\s+(?:\d{1,2}\s+)?picks?\b|\bgive\s+me\s+\d{1,2}\s+(?:games?|picks?)\b/i.test(message);
+  return /\bbest\s+plays?\b|\bhigh[- ]probability\b|\bsafest\b|\blow[- ]risk\b|\btop\s+(?:\d{1,2}\s+)?picks?\b|\bgive\s+me\s+\d{1,2}\s+(?:games?|picks?)\b|\b(?:across|all)\s+(?:the\s+)?(?:games|fixtures|leagues|slate)\b/i.test(message);
+}
+
+export function normalizeFootballQuestion(message: string): string {
+  return message
+    .normalize("NFKC")
+    .replace(/[’‘]/g, "'")
+    .replace(/\bmanchester\s+united\b/gi, "Man Utd")
+    .replace(/\bmanchester\s+city\b/gi, "Man City")
+    .replace(/\bvs\.?\b/gi, "vs")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function shouldOpenAnalysisBoard(message: string): boolean {
+  return /\bopen\s+(?:the\s+)?analysis\s+board\b|\bshow\s+(?:the\s+)?(?:analysis\s+)?board\b|\bfull\s+breakdown\b|\bshow\s+stats?\s+cards\b/i.test(message);
+}
+
+export function extractTargetMarket(message: string): TargetMarket {
+  const text = normalizeFootballQuestion(message).toLowerCase();
+  if (/\bcorrect\s+score\b/.test(text)) return "correct_score";
+  if (/\btotal\s+shots?\b|\bshots?\s+(?:market|line)\b/.test(text)) return "total_shots";
+  if (/\bbtts\b|\bboth\s+teams\s+to\s+score\b/.test(text)) return "btts";
+  if (/\bdouble\s+chance\b/.test(text)) return "double_chance";
+  if (/\bdraw\s+no\s+bet\b|\bdnb\b/.test(text)) return "draw_no_bet";
+  if (/\basian\s+handicap\b|\bhandicap\b/.test(text)) return "asian_handicap";
+  if (/\b1x2\b|\bmatch\s+(?:winner|result)\b|\bfor\s+(?:the\s+)?win\b/.test(text)) return "1x2";
+  if (/\bgoals?\b|\bover\b|\bunder\b|\btotal\b/.test(text)) return "goals";
+  return "all";
 }
 
 export async function classifyIntent(message: string): Promise<ChatIntent> {
-  if (extractRequestedMatch(message)) return "analyse_match";
-  if (isBestPlaysRequest(message)) return "best_plays";
+  const normalized = normalizeFootballQuestion(message);
+  if (shouldOpenAnalysisBoard(normalized)) return "open_board";
+  if (extractRequestedMatch(normalized)) return "analyse_match";
+  if (/^(?:for|show|give me)\s+(?:the\s+)?(?:over|under|goals?|correct score|total shots?|btts|1x2|double chance|draw no bet|asian handicap)\b/i.test(normalized)) {
+    return "analyse_match";
+  }
+  if (isBestPlaysRequest(normalized)) return "best_plays";
   try {
     const response = await generateWithFallback(
-      `Classify this football chat message into exactly one category: best_plays, analyse_match, explain_pick, or general.\n\nMessage: ${message}`,
+      `Classify this football chat message into exactly one category: best_plays, analyse_match, explain_pick, open_board, or general. Return JSON with an intent property.\n\nMessage: ${normalized}`,
       { temperature: 0, responseMimeType: "application/json" },
     );
     const parsed = JSON.parse(response) as { intent?: unknown };
-    if (parsed.intent === "best_plays" || parsed.intent === "analyse_match" || parsed.intent === "explain_pick" || parsed.intent === "general") {
+    if (parsed.intent === "best_plays" || parsed.intent === "analyse_match" || parsed.intent === "explain_pick" || parsed.intent === "open_board" || parsed.intent === "general") {
       return parsed.intent;
     }
   } catch {
-    // Deterministic fallback keeps chat usable when Gemini is unavailable.
+    // Keep deterministic classification available when Gemini is not.
   }
-  const text = message.toLowerCase();
-  if (/best|today|rank|value|safe|over|under|high probability|top picks/.test(text)) return "best_plays";
+  const text = normalized.toLowerCase();
+  if (/best|today|rank|value|high probability|top picks/.test(text)) return "best_plays";
   if (/why|because|justify|reason/.test(text)) return "explain_pick";
-  if (/analyse|analysis|vs|versus|match|chelsea|spurs|arsenal/.test(text)) return "analyse_match";
   return "general";
 }
